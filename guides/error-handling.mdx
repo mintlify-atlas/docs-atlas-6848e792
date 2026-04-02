@@ -1,0 +1,237 @@
+---
+title: "Error handling"
+description: "Handle and customize errors in your Vapor application"
+---
+
+Vapor catches all errors thrown by route handlers and middleware and converts them into HTTP responses. The default behavior differs based on whether the error conforms to `AbortError` and whether the app is running in release mode.
+
+## How errors are handled
+
+When any code in the request pipeline throws an error, `ErrorMiddleware` intercepts it and:
+
+1. Inspects the error type to determine the HTTP status code and reason string.
+2. Logs the error with request metadata (method, URL, user-agent).
+3. Serializes the error into a JSON response body.
+
+The JSON structure is always:
+
+```json
+{
+  "error": true,
+  "reason": "A description of what went wrong"
+}
+```
+
+---
+
+## Throwing HTTP errors with `Abort`
+
+`Abort` is the standard way to throw an HTTP error from a route handler or middleware:
+
+```swift
+// Throw a 404 with the default reason phrase
+throw Abort(.notFound)
+
+// Throw a 400 with a custom reason
+throw Abort(.badRequest, reason: "Username must not be empty")
+
+// Throw a 401
+throw Abort(.unauthorized)
+
+// Throw a 403 with a custom message
+throw Abort(.forbidden, reason: "You do not have permission to access this resource")
+
+// Throw a 422
+throw Abort(.unprocessableEntity, reason: "Invalid JSON payload")
+```
+
+You can also attach additional response headers:
+
+```swift
+var headers = HTTPHeaders()
+headers.add(name: .retryAfter, value: "60")
+throw Abort(.tooManyRequests, headers: headers, reason: "Rate limit exceeded")
+```
+
+---
+
+## The `AbortError` protocol
+
+Any error type conforming to `AbortError` is treated as an intended HTTP error — Vapor surfaces the `reason` string to the client in both development and production.
+
+```swift
+public protocol AbortError: Error {
+    var reason: String { get }
+    var status: HTTPResponseStatus { get }
+    var headers: HTTPHeaders { get } // optional, defaults to [:]
+}
+```
+
+Non-`AbortError` errors are treated as internal server errors:
+- In **debug builds**: the error's `description` is included in the response.
+- In **release builds**: the reason is replaced with `"Something went wrong."` to avoid leaking internal details.
+
+---
+
+## Custom error types
+
+Conform your own error type to `AbortError` to control the HTTP status and message:
+
+```swift
+enum AppError: AbortError {
+    case userNotFound(id: UUID)
+    case insufficientCredits(required: Int, available: Int)
+    case featureDisabled(String)
+
+    var status: HTTPResponseStatus {
+        switch self {
+        case .userNotFound:       return .notFound
+        case .insufficientCredits: return .paymentRequired
+        case .featureDisabled:    return .forbidden
+        }
+    }
+
+    var reason: String {
+        switch self {
+        case .userNotFound(let id):
+            return "No user found with ID \(id)"
+        case .insufficientCredits(let required, let available):
+            return "Need \(required) credits, but only \(available) available"
+        case .featureDisabled(let name):
+            return "\(name) is not enabled for your account"
+        }
+    }
+}
+```
+
+Throw it from any route:
+
+```swift
+app.get("users", ":id") { req async throws -> User in
+    guard let id = req.parameters.get("id", as: UUID.self),
+          let user = try await User.find(id, on: req.db)
+    else {
+        throw AppError.userNotFound(id: req.parameters.get("id").flatMap(UUID.init) ?? .init())
+    }
+    return user
+}
+```
+
+---
+
+## `ErrorMiddleware`
+
+`ErrorMiddleware` is added automatically by Vapor. It catches errors from all downstream middleware and route handlers.
+
+### Default middleware
+
+The default implementation (`ErrorMiddleware.default(environment:)`) handles the full error-to-response pipeline described above.
+
+### Custom error middleware
+
+Replace the default middleware to customize the error response format:
+
+```swift
+// In configure.swift — clear the existing default and add your own
+app.middleware = Middlewares()
+app.middleware.use(ErrorMiddleware { req, error in
+    let status: HTTPResponseStatus
+    let message: String
+
+    if let abort = error as? AbortError {
+        status = abort.status
+        message = abort.reason
+    } else {
+        status = .internalServerError
+        message = req.application.environment.isRelease
+            ? "Internal server error"
+            : String(describing: error)
+    }
+
+    let body = try? JSONEncoder().encode(["code": status.code.description, "message": message])
+    return Response(
+        status: status,
+        headers: ["Content-Type": "application/json"],
+        body: .init(data: body ?? Data())
+    )
+})
+```
+
+<Warning>
+  Clearing `app.middleware` removes all default middleware, including `RouteLoggingMiddleware`. Make sure to re-add any middleware you want to keep.
+</Warning>
+
+---
+
+## Decoding errors
+
+`DecodingError` automatically conforms to `AbortError` in Vapor with a status of `400 Bad Request`. This means a malformed JSON body produces a helpful error response automatically:
+
+```json
+{
+  "error": true,
+  "reason": "No such key 'email' at path ''"
+}
+```
+
+---
+
+## Logging errors
+
+`ErrorMiddleware` calls `req.logger.report(error:)` on every caught error. For `AbortError` types with a 4xx status, this typically logs at the `.warning` level; for 5xx and unknown errors it logs at `.error`. The log entry includes the request method, URL, and user-agent.
+
+To log errors manually:
+
+```swift
+app.get("risky") { req async throws -> String in
+    do {
+        return try await riskyOperation()
+    } catch {
+        req.logger.error("riskyOperation failed: \(error)")
+        throw Abort(.internalServerError)
+    }
+}
+```
+
+---
+
+## Full example
+
+```swift
+// Errors.swift
+enum ShopError: AbortError {
+    case outOfStock(itemID: UUID)
+    case orderTooLarge(max: Int)
+
+    var status: HTTPResponseStatus {
+        switch self {
+        case .outOfStock:    return .conflict
+        case .orderTooLarge: return .badRequest
+        }
+    }
+
+    var reason: String {
+        switch self {
+        case .outOfStock(let id):   return "Item \(id) is out of stock"
+        case .orderTooLarge(let m): return "Order exceeds maximum of \(m) items"
+        }
+    }
+}
+
+// routes.swift
+app.post("orders") { req async throws -> Order in
+    let input = try req.content.decode(OrderRequest.self)
+
+    guard input.quantity <= 100 else {
+        throw ShopError.orderTooLarge(max: 100)
+    }
+
+    guard let item = try await Item.find(input.itemID, on: req.db),
+          item.stock > 0
+    else {
+        throw ShopError.outOfStock(itemID: input.itemID)
+    }
+
+    return try await createOrder(input, on: req.db)
+}
+```

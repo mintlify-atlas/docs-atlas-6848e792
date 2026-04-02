@@ -1,0 +1,256 @@
+---
+title: "Validation"
+description: "Validate request input with Vapor's built-in validation framework"
+---
+
+Vapor's validation framework lets you define and enforce input rules on any `Decodable` type. Validation runs during decoding, so invalid input is rejected before your route handler runs.
+
+## The `Validatable` protocol
+
+Conform your request type to `Validatable` and implement `validations(_:)` to declare rules:
+
+```swift
+struct CreateUserRequest: Content, Validatable {
+    let name: String
+    let email: String
+    let age: Int
+    let website: String?
+
+    static func validations(_ validations: inout Validations) {
+        validations.add("name", as: String.self, is: .count(2...64) && .alphanumeric)
+        validations.add("email", as: String.self, is: .email)
+        validations.add("age", as: Int.self, is: .range(18...))
+        validations.add("website", as: String.self, is: .url, required: false)
+    }
+}
+```
+
+Then trigger validation in your route handler:
+
+```swift
+app.post("users") { req async throws -> HTTPStatus in
+    try CreateUserRequest.validate(content: req)
+    let input = try req.content.decode(CreateUserRequest.self)
+    // `input` is safe to use
+    return .created
+}
+```
+
+<Note>
+  `validate(content:)` and `validate(query:)` are separate calls from `req.content.decode(_:)`. Call `validate` first — it throws a `ValidationsError` (which is an `AbortError` returning `400 Bad Request`) if any rule fails.
+</Note>
+
+---
+
+## Adding validations
+
+`Validations.add` has several overloads:
+
+```swift
+// Typed field with a validator
+validations.add("username", as: String.self, is: .count(3...20))
+
+// Optional field (not required)
+validations.add("bio", as: String.self, is: .count(...500), required: false)
+
+// Custom failure message
+validations.add("age", as: Int.self, is: .range(0...120), customFailureDescription: "Age must be between 0 and 120")
+
+// Nested object
+validations.add("address") { nested in
+    nested.add("street", as: String.self, is: !.empty)
+    nested.add("city", as: String.self, is: !.empty)
+}
+
+// Array elements
+validations.add(each: "tags") { index, nested in
+    nested.add("name", as: String.self, is: .count(1...50))
+}
+```
+
+---
+
+## Built-in validators
+
+<Accordion title="String validators">
+
+| Validator | Description |
+|---|---|
+| `.email` | Valid email address (ASCII, max 320 chars, local part max 64 chars) |
+| `.internationalEmail` | Valid email address including Unicode characters |
+| `.url` | Valid URL with a scheme and host, or a file URL |
+| `.alphanumeric` | Only `a-z`, `A-Z`, `0-9` |
+| `.ascii` | Only ASCII characters (bytes 0–127) |
+| `.characterSet(_:)` | Characters belong to a `Foundation.CharacterSet` |
+| `.count(_:)` | String length within a range (e.g. `.count(8...128)`) |
+| `.pattern(_:)` | String matches a regular expression pattern (full match) |
+| `.empty` | String is empty |
+
+</Accordion>
+
+<Accordion title="Numeric validators">
+
+| Validator | Description |
+|---|---|
+| `.range(_:)` | Value falls within a range (e.g. `.range(1...100)`) |
+
+Supports `ClosedRange`, `PartialRangeFrom`, `PartialRangeThrough`, `PartialRangeUpTo`, and `Range`.
+
+</Accordion>
+
+<Accordion title="Collection validators">
+
+| Validator | Description |
+|---|---|
+| `.count(_:)` | Collection has a count within the range |
+| `.empty` | Collection is empty |
+
+</Accordion>
+
+<Accordion title="General validators">
+
+| Validator | Description |
+|---|---|
+| `.in(_:)` | Value is one of the supplied options |
+| `.case(of:)` | Value matches a raw value of a `CaseIterable` `RawRepresentable` enum |
+| `.valid` | Always passes (default when no validator is specified) |
+| `.nil` | Value is `nil` (available on `Optional` types) |
+| `.custom(_:validationClosure:)` | Inline custom validation with a description string |
+
+</Accordion>
+
+---
+
+## Combining validators
+
+Use `&&` to require both validators to pass, and `||` to require at least one:
+
+```swift
+// Must be an email AND under 320 characters
+validations.add("email", as: String.self, is: .email && .count(...320))
+
+// Must be alphanumeric OR a valid URL
+validations.add("handle", as: String.self, is: .alphanumeric || .url)
+```
+
+Use the prefix `!` operator to invert any validator:
+
+```swift
+// Must not be empty
+validations.add("title", as: String.self, is: !.empty)
+```
+
+---
+
+## Custom validators
+
+Use `Validator.custom` to write inline validation logic. The first argument is the description shown in error messages; the `validationClosure` receives the value and returns `true` for success:
+
+```swift
+let noSpaces: Validator<String> = .custom(
+    "no spaces",
+    validationClosure: { value in !value.contains(" ") }
+)
+
+validations.add("username", as: String.self, is: noSpaces && .count(3...30))
+```
+
+Or create a reusable `Validator` directly using the `init(validate:)` initializer:
+
+```swift
+extension Validator where T == String {
+    static var noSpaces: Validator<T> {
+        .init { value in
+            guard !value.contains(" ") else {
+                return ValidatorResults.Custom(isSuccess: false, validationDescription: "no spaces")
+            }
+            return ValidatorResults.Custom(isSuccess: true, validationDescription: "no spaces")
+        }
+    }
+}
+```
+
+---
+
+## Validating query parameters
+
+Use `validate(query:)` to validate URL query string parameters:
+
+```swift
+struct SearchQuery: Content, Validatable {
+    let q: String
+    let page: Int?
+
+    static func validations(_ validations: inout Validations) {
+        validations.add("q", as: String.self, is: .count(1...100))
+        validations.add("page", as: Int.self, is: .range(1...), required: false)
+    }
+}
+
+app.get("search") { req throws -> [Result] in
+    try SearchQuery.validate(query: req)
+    let query = try req.query.decode(SearchQuery.self)
+    // ...
+}
+```
+
+---
+
+## Error responses
+
+When validation fails, Vapor throws a `ValidationsError`. Because `ValidationsError` conforms to `AbortError`, it produces a `400 Bad Request` response with a JSON body:
+
+```json
+{
+  "error": true,
+  "reason": "email is not a valid email address, age is less than minimum of 18"
+}
+```
+
+The `reason` string is a comma-separated list of failure descriptions from all failing fields. You can provide a custom message per field using `customFailureDescription`:
+
+```swift
+validations.add(
+    "password",
+    as: String.self,
+    is: .count(8...),
+    customFailureDescription: "Password must be at least 8 characters."
+)
+```
+
+---
+
+## Full example
+
+```swift
+struct RegistrationRequest: Content, Validatable {
+    let email: String
+    let password: String
+    let age: Int
+    let referralCode: String?
+
+    static func validations(_ validations: inout Validations) {
+        validations.add("email", as: String.self, is: .email)
+        validations.add(
+            "password",
+            as: String.self,
+            is: .count(8...) && .ascii,
+            customFailureDescription: "Password must be at least 8 ASCII characters."
+        )
+        validations.add("age", as: Int.self, is: .range(13...))
+        validations.add(
+            "referralCode",
+            as: String.self,
+            is: .count(6...6) && .alphanumeric,
+            required: false
+        )
+    }
+}
+
+app.post("register") { req async throws -> HTTPStatus in
+    try RegistrationRequest.validate(content: req)
+    let input = try req.content.decode(RegistrationRequest.self)
+    try await createUser(input, db: req.db)
+    return .created
+}
+```

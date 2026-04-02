@@ -1,0 +1,88 @@
+{
+  "projectType": "framework",
+  "projectName": "Vapor",
+  "projectDescription": "A server-side Swift HTTP web framework for building APIs, websites, and cloud services with expressive, type-safe routing and middleware.",
+  "theme": "palm",
+  "primaryColor": "#e57cf9",
+  "lightColor": "#353536",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "getting-started/installation",
+              "getting-started/quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/application",
+              "concepts/routing",
+              "concepts/request-response",
+              "concepts/middleware",
+              "concepts/content"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/authentication",
+              "guides/sessions",
+              "guides/validation",
+              "guides/websockets",
+              "guides/environment",
+              "guides/error-handling"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/services",
+              "advanced/async",
+              "advanced/testing",
+              "advanced/deployment"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Expressive, type-safe routing with path parameters",
+    "Async/await and SwiftNIO-based concurrency",
+    "Built-in middleware system (CORS, compression, error handling)",
+    "Codable-based request/response content encoding (JSON, multipart, URL-encoded form)",
+    "WebSocket support",
+    "Session management with pluggable drivers",
+    "Authentication helpers (Basic, Bearer, session-based)",
+    "Input validation framework",
+    "HTTP/1 and HTTP/2 support with TLS via SwiftNIO",
+    "Built-in Bcrypt password hashing",
+    "Structured logging and distributed tracing",
+    "Environment-based configuration with secret support"
+  ],
+  "publicApiSurface": [
+    "Application",
+    "RoutesBuilder (get, post, put, patch, delete, on)",
+    "RouteCollection",
+    "Request",
+    "Response",
+    "Middleware",
+    "Content / ResponseEncodable / RequestDecodable",
+    "Authenticator / BasicAuthenticator / BearerAuthenticator",
+    "SessionsMiddleware / Session",
+    "Validations / Validator",
+    "Environment",
+    "CORSMiddleware",
+    "FileMiddleware",
+    "ErrorMiddleware",
+    "WebSocket (via RoutesBuilder+WebSocket)",
+    "VaporTesting / XCTVapor (test helpers)"
+  ]
+}

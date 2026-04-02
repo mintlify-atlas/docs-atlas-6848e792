@@ -1,0 +1,200 @@
+---
+title: "Environment"
+description: "Configure your Vapor app with environment variables and secrets"
+---
+
+Vapor's `Environment` type represents the runtime context your application is running in and provides access to process environment variables. It is available throughout your app as `app.environment`.
+
+## Built-in environments
+
+Vapor defines three preset environments and a factory for custom ones:
+
+| Value | Name string |
+|---|---|
+| `.development` | `"development"` |
+| `.production` | `"production"` |
+| `.testing` | `"testing"` |
+| `.custom(name:)` | any string |
+
+Two environments are equal if their `name` strings match.
+
+```swift
+if app.environment == .production {
+    // apply production-only configuration
+}
+
+switch app.environment {
+case .development:
+    app.logger.logLevel = .debug
+case .production:
+    app.logger.logLevel = .warning
+default:
+    app.logger.logLevel = .info
+}
+```
+
+### `isRelease`
+
+`env.isRelease` returns `true` when the binary is built in release mode (i.e., without debug assertions), regardless of the environment name. This allows you to test production environment behavior while still retaining debug information when building with `-c debug`.
+
+---
+
+## Detecting the environment
+
+Vapor detects the active environment from the `--env` (or `-e`) command-line flag, falling back to the `VAPOR_ENV` environment variable. If neither is set, it defaults to `.development`.
+
+In your `@main` entry point:
+
+```swift
+import Vapor
+import Logging
+
+@main
+struct Entrypoint {
+    static func main() async throws {
+        var env = try Environment.detect()
+        try LoggingSystem.bootstrap(from: &env)
+        let app = try await Application.make(env)
+        do {
+            try configure(app)
+            try await app.execute()
+            try await app.asyncShutdown()
+        } catch {
+            try? await app.asyncShutdown()
+            throw error
+        }
+    }
+}
+```
+
+You can also construct an environment directly:
+
+```swift
+let app = try await Application.make(.production)
+```
+
+---
+
+## Reading environment variables
+
+### `Environment.get(_:)`
+
+Returns an environment variable as a `String?`:
+
+```swift
+let dbURL = Environment.get("DATABASE_URL") ?? "postgres://localhost/mydb"
+```
+
+### `Environment.process`
+
+`Environment.process` is a `@dynamicMemberLookup` wrapper around `ProcessInfo.processInfo.environment`. It lets you access variables as properties and converts them to any `LosslessStringConvertible` type:
+
+```swift
+// As String
+let apiKey: String? = Environment.process.API_KEY
+
+// As a specific type
+let port: Int? = Environment.process.PORT
+
+// Write to the process environment at runtime
+Environment.process.MY_FLAG = "true"
+```
+
+---
+
+## `.env` file support
+
+Vapor can load `.env` files in development to avoid setting variables in your shell. Use `DotEnvFile` in `configure.swift`:
+
+```swift
+func configure(_ app: Application) async throws {
+    // Loads .env.development first, then .env
+    // Earlier values take precedence (not overwritten)
+    await DotEnvFile.load(for: app.environment, fileio: app.fileio)
+
+    // Or load a specific file
+    await DotEnvFile.load(path: ".env.local", fileio: app.fileio)
+}
+```
+
+Dotenv file format:
+
+```bash
+DATABASE_URL=postgres://localhost/mydb
+API_KEY='secret-key-value'
+GREETING="Hello\nWorld"   # double quotes support \n escape
+# This is a comment
+```
+
+<Note>
+  `.env` files should not be committed to version control. Add `.env` and `.env.*` to your `.gitignore`.
+</Note>
+
+---
+
+## Reading secrets from files
+
+In containerized environments (e.g. Docker Swarm, Kubernetes), secrets are often mounted as files rather than environment variables. Use `Environment.secret(key:)` to read the file path from an environment variable and return the file contents:
+
+```swift
+func configure(_ app: Application) async throws {
+    // DATABASE_PASSWORD_FILE=/run/secrets/db_password
+    let dbPassword = try await Environment.secret(key: "DATABASE_PASSWORD_FILE")
+
+    // Or read a file path directly
+    let cert = try await Environment.secret(path: "/run/secrets/tls_cert")
+}
+```
+
+Both methods return `String?` — `nil` if the environment variable is unset or the file cannot be read. Leading and trailing whitespace (including newlines) is trimmed from the result.
+
+<Warning>
+  Do not use `.wait()` on the EventLoopFuture-based secret APIs inside request handlers. Use the `async` variants shown above, or chain the future.
+</Warning>
+
+---
+
+## Using the environment in route handlers
+
+Access `req.application.environment` from any route:
+
+```swift
+app.get("info") { req -> String in
+    "Running in: \(req.application.environment.name)"
+}
+```
+
+Or gate behavior on environment:
+
+```swift
+app.get("debug") { req -> Response in
+    guard req.application.environment != .production else {
+        throw Abort(.notFound)
+    }
+    return Response(body: .init(string: "Debug info..."))
+}
+```
+
+---
+
+## Example: environment-driven configuration
+
+```swift
+func configure(_ app: Application) async throws {
+    // Load .env file for non-production environments
+    if app.environment != .production {
+        await DotEnvFile.load(for: app.environment, fileio: app.fileio)
+    }
+
+    // Read database URL from environment
+    guard let dbURL = Environment.get("DATABASE_URL") else {
+        throw Abort(.internalServerError, reason: "DATABASE_URL not set")
+    }
+
+    // Read a Docker secret for the database password
+    let dbPassword = try await Environment.secret(key: "DATABASE_PASSWORD_FILE")
+
+    // Adjust logging based on environment
+    app.logger.logLevel = app.environment.isRelease ? .warning : .debug
+}
+```

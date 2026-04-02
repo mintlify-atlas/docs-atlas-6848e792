@@ -1,0 +1,56 @@
+---
+title: "Vapor"
+description: "A server-side Swift HTTP web framework for building APIs, websites, and cloud services."
+---
+
+Vapor is an open-source HTTP web framework written in Swift. Built on top of SwiftNIO, it gives you a fast, expressive, and type-safe foundation for building server-side applications — from REST APIs to full-featured web services.
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/getting-started/installation">
+    Install Vapor and set up your development environment
+  </Card>
+  <Card title="Quick Start" icon="rocket" href="/getting-started/quickstart">
+    Build and run your first Vapor app in minutes
+  </Card>
+  <Card title="Routing" icon="route" href="/concepts/routing">
+    Define expressive, type-safe HTTP routes
+  </Card>
+  <Card title="Middleware" icon="layer-group" href="/concepts/middleware">
+    Chain request/response processing with middleware
+  </Card>
+  <Card title="Authentication" icon="lock" href="/guides/authentication">
+    Add Basic, Bearer, and session-based auth
+  </Card>
+  <Card title="Testing" icon="flask" href="/advanced/testing">
+    Test your Vapor app with VaporTesting
+  </Card>
+</CardGroup>
+
+## What you can build
+
+Vapor is designed for server-side Swift projects of all kinds:
+
+- **REST APIs** — Expressive routing, Codable content encoding, and full HTTP/2 support
+- **Web applications** — Sessions, views, file serving, and WebSocket support
+- **Microservices** — Lightweight, async-first, and deployable via Docker or Linux
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Async/Await" icon="bolt">
+    Built on Swift concurrency and SwiftNIO for non-blocking, high-performance I/O
+  </Card>
+  <Card title="Type-safe routing" icon="shield-check">
+    Path parameters, query strings, and request bodies are decoded with Swift's type system
+  </Card>
+  <Card title="Codable content" icon="code">
+    Automatic JSON, multipart, and URL-encoded form encoding/decoding via Swift's Codable
+  </Card>
+  <Card title="Middleware system" icon="filter">
+    CORS, compression, error handling, logging, and tracing middleware included out of the box
+  </Card>
+</CardGroup>
+
+<Note>
+  Vapor requires Swift 6.0 or later and supports macOS 10.15+, iOS 13+, tvOS 13+, and watchOS 6+.
+</Note>

@@ -1,0 +1,173 @@
+---
+title: "Quick Start"
+description: "Build and run your first Vapor application"
+keywords: ["vapor", "swift", "quickstart", "hello world", "routes", "run", "serve"]
+---
+
+This guide walks you through creating a minimal Vapor application that responds to HTTP requests.
+
+<Note>
+  Complete the [Installation](/getting-started/installation) steps before continuing. You need Swift 6.0+ and a `Package.swift` that already declares `Vapor` as a dependency.
+</Note>
+
+<Steps>
+  <Step title="Create your entrypoint">
+    Vapor applications use a `@main` entry point. Create (or replace) `Sources/App/entrypoint.swift` with the following:
+
+    ```swift Sources/App/entrypoint.swift
+    import Vapor
+    import Logging
+
+    @main
+    struct Entrypoint {
+        static func main() async throws {
+            var env = try Environment.detect()
+            try LoggingSystem.bootstrap(from: &env)
+
+            let app = try await Application.make(env)
+            do {
+                try configure(app)
+                try await app.execute()
+                try await app.asyncShutdown()
+            } catch {
+                try? await app.asyncShutdown()
+                throw error
+            }
+        }
+    }
+    ```
+
+    `Environment.detect()` reads the `--env` flag (or the `APP_ENV` environment variable) so you can switch between `.development`, `.production`, and custom environments without recompiling. `Application.make(_:)` is the async initialiser — it sets up the HTTP server, logging, and all built-in services.
+
+    <Tip>
+      Always call `asyncShutdown()` before your process exits. Vapor uses SwiftNIO event loop threads and open file handles that must be released cleanly.
+    </Tip>
+  </Step>
+
+  <Step title="Define a configure function">
+    Create `Sources/App/configure.swift`. This is where you register routes, middleware, and services:
+
+    ```swift Sources/App/configure.swift
+    import Vapor
+
+    public func configure(_ app: Application) throws {
+        try routes(app)
+    }
+    ```
+  </Step>
+
+  <Step title="Add your first route">
+    Create `Sources/App/routes.swift` and define a `GET /hello` route:
+
+    ```swift Sources/App/routes.swift
+    import Vapor
+
+    public func routes(_ app: Application) throws {
+        app.get("hello") { req async -> String in
+            return "Hello, world!"
+        }
+    }
+    ```
+
+    Route handlers receive a `Request` and return any `ResponseEncodable` value — a `String`, a `Codable` struct, an `HTTPStatus`, and so on. Vapor encodes the return value and sets the appropriate `Content-Type` header automatically.
+
+    You can also match URL parameters:
+
+    ```swift
+    app.get("hello", ":name") { req -> String in
+        let name = req.parameters.get("name") ?? "world"
+        return "Hello, \(name)!"
+    }
+    ```
+  </Step>
+
+  <Step title="Build and run">
+    <Tabs>
+      <Tab title="Terminal">
+        From your package root, run:
+
+        ```bash
+        swift run
+        ```
+
+        SPM compiles your target and starts the server. You should see output similar to:
+
+        ```
+        [ NOTICE ] Server starting on http://127.0.0.1:8080
+        ```
+
+        To pass flags to the serve command directly, use `--` to separate SPM arguments from your app's arguments:
+
+        ```bash
+        swift run App serve --hostname 0.0.0.0 --port 8080
+        ```
+      </Tab>
+      <Tab title="Xcode">
+        Select the `App` scheme, choose **My Mac** as the destination, and press **Run** (⌘R).
+
+        Xcode passes command-line arguments through **Product → Scheme → Edit Scheme → Arguments**. Add `serve` as the first argument if the default command is not `serve`.
+      </Tab>
+    </Tabs>
+
+    <Warning>
+      The development server binds to `127.0.0.1` (localhost) by default. To accept connections from other machines, pass `--hostname 0.0.0.0`.
+    </Warning>
+  </Step>
+
+  <Step title="Test your route">
+    With the server running, send a request using `curl`:
+
+    ```bash
+    curl http://localhost:8080/hello
+    ```
+
+    Expected response:
+
+    ```
+    Hello, world!
+    ```
+
+    If you added the parameterised route:
+
+    ```bash
+    curl http://localhost:8080/hello/Vapor
+    ```
+
+    ```
+    Hello, Vapor!
+    ```
+  </Step>
+</Steps>
+
+## Project structure
+
+A typical Vapor project organises source files like this:
+
+```
+MyApp/
+├── Package.swift
+└── Sources/
+    └── App/
+        ├── entrypoint.swift   # @main entry point
+        ├── configure.swift    # service and middleware registration
+        └── routes.swift       # route definitions
+```
+
+Keeping `configure` and `routes` in separate files makes it easier to grow your application without cluttering the entry point.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Routing" icon="map" href="/concepts/routing">
+    Learn how to define routes, use route groups, and handle path and query parameters.
+  </Card>
+  <Card title="Request & Response" icon="arrow-right-arrow-left" href="/concepts/request-response">
+    Decode request bodies and encode typed responses using Vapor's `Content` protocol.
+  </Card>
+  <Card title="Middleware" icon="layer-group" href="/concepts/middleware">
+    Intercept and transform requests and responses with reusable middleware.
+  </Card>
+  <Card title="Testing" icon="flask" href="/advanced/testing">
+    Write integration tests with `VaporTesting` or `XCTVapor` without running a live server.
+  </Card>
+</CardGroup>

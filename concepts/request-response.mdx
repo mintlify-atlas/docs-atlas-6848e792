@@ -1,0 +1,244 @@
+---
+title: "Request & Response"
+description: "Working with HTTP requests and responses in Vapor"
+---
+
+Every route handler receives a `Request` and must return something conforming to `ResponseEncodable`. This page covers the properties of both types and how to read and build HTTP messages.
+
+## The `Request` type
+
+`Request` is a `final class` (reference type, `Sendable`) that represents a single incoming HTTP request. It is created by Vapor's server pipeline and passed to your route handler.
+
+### Key properties
+
+| Property | Type | Description |
+|---|---|---|
+| `req.method` | `HTTPMethod` | HTTP verb: `.GET`, `.POST`, `.PUT`, `.PATCH`, `.DELETE`, etc. |
+| `req.url` | `URI` | Full URL including path, query string, fragment |
+| `req.headers` | `HTTPHeaders` | All request headers |
+| `req.body` | `Body` | The raw request body |
+| `req.parameters` | `Parameters` | Captured URL path parameters |
+| `req.query` | `URLQueryContainer` | URL query string accessor |
+| `req.content` | `ContentContainer` | Body decoding / encoding |
+| `req.cookies` | `HTTPCookies` | Parsed `Cookie` header |
+| `req.logger` | `Logger` | Request-scoped logger with `request-id` metadata |
+| `req.id` | `String` | Unique request ID (from `X-Request-Id` header or auto-generated) |
+| `req.route` | `Route?` | The matched route object |
+| `req.peerAddress` | `SocketAddress?` | Client IP, respecting `Forwarded` / `X-Forwarded-For` headers |
+| `req.application` | `Application` | Reference to the running application |
+| `req.eventLoop` | `EventLoop` | The NIO event loop handling this request |
+| `req.storage` | `Storage` | Per-request arbitrary storage |
+
+### Reading headers
+
+`HTTPHeaders` supports subscripting by `HTTPHeaders.Name`:
+
+```swift
+app.get("echo-ua") { req -> String in
+    let ua = req.headers.first(name: .userAgent) ?? "unknown"
+    return "Your User-Agent: \(ua)"
+}
+```
+
+Check for a specific content type:
+
+```swift
+if req.headers.contentType == .json {
+    // request body is JSON
+}
+```
+
+### Reading the body
+
+The body is collected by default (up to the route's configured limit). Access the raw bytes via:
+
+```swift
+if let buffer = req.body.data {
+    let bytes = buffer.readableBytesView
+}
+```
+
+For decoded content, use `req.content` (see [Content](/concepts/content)).
+
+### Reading query string parameters
+
+Use `req.query` to access URL query parameters:
+
+```swift
+// GET /search?q=vapor&page=2
+
+app.get("search") { req -> String in
+    let q = try req.query.get(String.self, at: "q")
+    let page = req.query[Int.self, at: "page"] ?? 1
+    return "Searching for '\(q)', page \(page)"
+}
+```
+
+Decode an entire query string into a `Decodable` struct:
+
+```swift
+struct SearchQuery: Content {
+    var q: String
+    var page: Int = 1
+}
+
+app.get("search") { req -> String in
+    let query = try req.query.decode(SearchQuery.self)
+    return "q=\(query.q) page=\(query.page)"
+}
+```
+
+### Path parameters
+
+Captured path parameters are available on `req.parameters`:
+
+```swift
+app.get("users", ":id") { req -> String in
+    // req.parameters.get returns String?
+    guard let id = req.parameters.get("id") else {
+        throw Abort(.badRequest)
+    }
+    return "User: \(id)"
+}
+```
+
+Use `require` for typed access with automatic error throwing:
+
+```swift
+let id = try req.parameters.require("id", as: UUID.self)
+```
+
+---
+
+## The `Response` type
+
+`Response` is a `final class` (reference type, `Sendable`) that represents an HTTP response sent back to the client.
+
+### Key properties
+
+| Property | Type | Description |
+|---|---|---|
+| `res.status` | `HTTPResponseStatus` | HTTP status code and reason phrase |
+| `res.headers` | `HTTPHeaders` | Response headers |
+| `res.body` | `Body` | Response body |
+| `res.cookies` | `HTTPCookies` | `Set-Cookie` header accessor |
+| `res.content` | `ContentContainer` | Body encoding / decoding |
+
+### Creating a response
+
+```swift
+// Simplest form — 200 OK with no body
+let res = Response()
+
+// With status and body
+let res = Response(
+    status: .created,
+    headers: ["X-Custom": "value"],
+    body: .init(string: "Created!")
+)
+```
+
+### Custom status codes
+
+Return an `HTTPStatus` directly from a route handler:
+
+```swift
+app.delete("users", ":id") { req -> HTTPStatus in
+    // perform deletion...
+    return .noContent // 204
+}
+```
+
+Or build a full `Response` for finer control:
+
+```swift
+app.post("items") { req -> Response in
+    let item = try req.content.decode(Item.self)
+    // save item...
+    let res = Response(status: .created)
+    try res.content.encode(item)
+    res.headers.replaceOrAdd(name: "Location", value: "/items/\(item.id)")
+    return res
+}
+```
+
+### Setting response headers
+
+```swift
+app.get("download") { req -> Response in
+    let res = Response(status: .ok, body: .init(string: "file contents"))
+    res.headers.contentType = .plainText
+    res.headers.replaceOrAdd(name: .contentDisposition, value: "attachment; filename=\"file.txt\"")
+    return res
+}
+```
+
+---
+
+## `ResponseEncodable`
+
+Any type returned from a route handler must conform to `ResponseEncodable`. Vapor provides built-in conformances for:
+
+- `Response` — returned as-is
+- `String` and `StaticString` — encoded as `text/plain; charset=utf-8`
+- All `Content` types — encoded as their `defaultContentType` (JSON by default)
+- `EventLoopFuture<T> where T: ResponseEncodable`
+- `HTTPStatus`
+
+You can also encode a response with a specific status and extra headers using the convenience method:
+
+```swift
+// Inside a route handler
+return try someContent.encodeResponse(status: .accepted, headers: ["X-Info": "v1"], for: req)
+```
+
+### Returning different types
+
+<CodeGroup>
+
+```swift string response
+app.get("hello") { req -> String in
+    return "Hello, world!"
+}
+```
+
+```swift content response
+struct User: Content {
+    var id: UUID
+    var name: String
+}
+
+app.get("me") { req -> User in
+    return User(id: UUID(), name: "Alice")
+}
+```
+
+```swift custom response
+app.get("redirect") { req -> Response in
+    return req.redirect(to: "https://vapor.codes")
+}
+```
+
+```swift http status
+app.delete("users", ":id") { req -> HTTPStatus in
+    return .noContent
+}
+```
+
+</CodeGroup>
+
+---
+
+## Async handlers
+
+All route handlers can be `async throws`:
+
+```swift
+app.get("users", ":id") { req async throws -> User in
+    let id = try req.parameters.require("id", as: UUID.self)
+    guard let user = try await User.find(id, on: req.db) else {
+        throw Abort(.notFound)
+    }
+    return user
+}
+```

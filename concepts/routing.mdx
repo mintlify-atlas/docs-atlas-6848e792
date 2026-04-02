@@ -1,0 +1,227 @@
+---
+title: "Routing"
+description: "Define HTTP routes with Vapor's expressive, type-safe routing API"
+---
+
+Routing maps an incoming HTTP method + path pair to a handler closure that returns a `ResponseEncodable` value. All routing is done through the `RoutesBuilder` protocol, which `Application` conforms to directly.
+
+## Basic route registration
+
+The most common way to register a route is through the HTTP-method shorthand on `app`:
+
+```swift
+app.get("hello") { req -> String in
+    return "Hello, world!"
+}
+
+app.post("users") { req -> User in
+    let user = try req.content.decode(User.self)
+    return user
+}
+
+app.put("users", ":id") { req -> HTTPStatus in
+    return .ok
+}
+
+app.patch("users", ":id") { req -> HTTPStatus in
+    return .ok
+}
+
+app.delete("users", ":id") { req -> HTTPStatus in
+    return .noContent
+}
+```
+
+Each method accepts a variadic list of `PathComponent` values followed by a `@Sendable` closure that receives a `Request` and returns anything conforming to `ResponseEncodable`.
+
+## The `on(_:_:use:)` method
+
+For programmatic control over the HTTP method or body streaming strategy, use `on`:
+
+```swift
+app.on(.GET, "health") { req in
+    return "OK"
+}
+
+// Collect the body up to 10 MB before calling the handler
+app.on(.POST, "upload", body: .collect(maxSize: "10mb")) { req in
+    guard let data = req.body.data else { throw Abort(.badRequest) }
+    // process data
+    return HTTPStatus.ok
+}
+
+// Receive the body as a stream without collecting it first
+app.on(.POST, "stream", body: .stream) { req in
+    // handle req.body as a stream
+    return HTTPStatus.ok
+}
+```
+
+`HTTPBodyStreamStrategy` options:
+
+| Case | Behaviour |
+|---|---|
+| `.collect` | Collect into memory using the app's `defaultMaxBodySize` (default 16 KB) |
+| `.collect(maxSize:)` | Collect into memory up to the given `ByteCount` |
+| `.stream` | Body arrives in chunks; no collection |
+
+## Path parameters
+
+Prefix a path component with `:` to capture a dynamic segment:
+
+```swift
+app.get("users", ":userID") { req -> String in
+    let id = req.parameters.get("userID") ?? "unknown"
+    return "User: \(id)"
+}
+```
+
+### Typed parameters with `require`
+
+Use `Parameters.require(_:as:)` to decode a parameter directly to any `LosslessStringConvertible` type. It throws an appropriate `Abort` error if the parameter is missing or cannot be converted:
+
+```swift
+app.get("users", ":userID") { req -> String in
+    let id = try req.parameters.require("userID", as: Int.self)
+    return "User ID: \(id)"
+}
+```
+
+`require(_:)` without a type returns a `String`:
+
+```swift
+let name = try req.parameters.require("name") // -> String
+```
+
+### UUID parameters
+
+`UUID` conforms to `LosslessStringConvertible` in Vapor, so it works directly:
+
+```swift
+app.get("items", ":itemID") { req -> String in
+    let id = try req.parameters.require("itemID", as: UUID.self)
+    return id.uuidString
+}
+```
+
+### Catchall
+
+Use `**` (the wildcard `PathComponent`) to match any remaining path segments:
+
+```swift
+app.get("files", "**") { req -> String in
+    return req.parameters.getCatchall().joined(separator: "/")
+}
+```
+
+## Route groups
+
+Groups let you share a path prefix or middleware across multiple routes.
+
+### `grouped` — returns a new builder
+
+```swift
+let users = app.grouped("users")
+users.get { req in /* GET /users */ }
+users.post { req in /* POST /users */ }
+users.get(":id") { req in /* GET /users/:id */ }
+```
+
+### `group` — closure-based
+
+```swift
+app.group("api", "v1") { v1 in
+    v1.get("status") { req in "OK" }
+    v1.post("users") { req in /* ... */ }
+}
+```
+
+Groups can be nested to any depth:
+
+```swift
+app.group("api") { api in
+    api.group("v1") { v1 in
+        v1.get("ping") { req in "pong" }
+    }
+}
+```
+
+## Middleware scoped to route groups
+
+Pass middleware to `grouped` or `group` to scope it to only those routes:
+
+```swift
+let protected = app.grouped(MyAuthMiddleware())
+protected.get("dashboard") { req in
+    // only reached if MyAuthMiddleware passes
+    return "Welcome"
+}
+
+app.group(RateLimitMiddleware(), LoggingMiddleware()) { limited in
+    limited.post("submit") { req in HTTPStatus.accepted }
+}
+```
+
+See [Middleware](/concepts/middleware) for details on writing custom middleware.
+
+## `RouteCollection`
+
+Organise related routes into a type that conforms to `RouteCollection`:
+
+```swift
+struct UserController: RouteCollection {
+    func boot(routes: RoutesBuilder) throws {
+        let users = routes.grouped("users")
+        users.get(use: index)
+        users.post(use: create)
+        users.group(":userID") { user in
+            user.get(use: show)
+            user.put(use: update)
+            user.delete(use: delete)
+        }
+    }
+
+    func index(req: Request) async throws -> [User] { /* ... */ }
+    func create(req: Request) async throws -> User { /* ... */ }
+    func show(req: Request) async throws -> User { /* ... */ }
+    func update(req: Request) async throws -> User { /* ... */ }
+    func delete(req: Request) async throws -> HTTPStatus { /* ... */ }
+}
+```
+
+Register the collection with `register(collection:)`:
+
+```swift
+try app.register(collection: UserController())
+```
+
+## Route metadata
+
+Each registered route returns a `Route` object. You can attach a human-readable description for use in the `vapor routes` CLI command:
+
+```swift
+app.get("health") { req in "OK" }
+    .description("Health check endpoint")
+```
+
+## Case-insensitive routing
+
+By default, constant path components are matched case-sensitively. To enable case-insensitive matching:
+
+```swift
+app.routes.caseInsensitive = true
+```
+
+<Warning>
+  Set `caseInsensitive` before the application starts. Changing it after boot has no effect.
+</Warning>
+
+## Listing registered routes
+
+Run `swift run App routes` (or `vapor routes` with the Vapor toolbox) to print a table of all registered routes to the console. You can also access them programmatically:
+
+```swift
+for route in app.routes.all {
+    print(route) // e.g. "GET /users/:userID"
+}
+```

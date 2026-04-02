@@ -1,0 +1,283 @@
+---
+title: "Middleware"
+description: "Chain request and response processing with Vapor's middleware system"
+---
+
+Middleware sits between the HTTP server and your route handlers. It can inspect and modify both incoming requests and outgoing responses, short-circuit the chain with its own response, or pass control to the next responder in the chain.
+
+## The request / response lifecycle
+
+```
+Client
+  │
+  ▼
+[ RouteLoggingMiddleware ]
+  │
+  ▼
+[ ErrorMiddleware ]
+  │
+  ▼
+[ your middleware... ]
+  │
+  ▼
+[ Route handler ]
+  │
+  ▼ (response travels back up through the same stack)
+Client
+```
+
+Middleware registered with `app.middleware.use(...)` wraps every request. Middleware registered on a route group only wraps those routes.
+
+## The `Middleware` protocol
+
+```swift
+public protocol Middleware: Sendable {
+    func respond(to request: Request, chainingTo next: Responder) -> EventLoopFuture<Response>
+}
+```
+
+Call `next.respond(to: request)` to continue the chain. Return an `EventLoopFuture<Response>` — either from `next` or a custom one you build.
+
+### Async variant
+
+For async code, conform to `AsyncMiddleware` instead:
+
+```swift
+public protocol AsyncMiddleware: Middleware {
+    func respond(to request: Request, chainingTo next: AsyncResponder) async throws -> Response
+}
+```
+
+`AsyncMiddleware` provides a bridge implementation of the `Middleware` requirement automatically, so you only need to implement the async method.
+
+## Writing custom middleware
+
+<Tabs>
+  <Tab title="Sync">
+    ```swift
+    import Vapor
+    import NIOCore
+
+    struct RequestTimingMiddleware: Middleware {
+        func respond(to request: Request, chainingTo next: Responder) -> EventLoopFuture<Response> {
+            let start = Date()
+            return next.respond(to: request).map { response in
+                let elapsed = Date().timeIntervalSince(start)
+                response.headers.replaceOrAdd(
+                    name: "X-Response-Time",
+                    value: String(format: "%.4fms", elapsed * 1000)
+                )
+                return response
+            }
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Async">
+    ```swift
+    import Vapor
+
+    struct RequestTimingMiddleware: AsyncMiddleware {
+        func respond(to request: Request, chainingTo next: AsyncResponder) async throws -> Response {
+            let start = Date()
+            let response = try await next.respond(to: request)
+            let elapsed = Date().timeIntervalSince(start)
+            response.headers.replaceOrAdd(
+                name: "X-Response-Time",
+                value: String(format: "%.4fms", elapsed * 1000)
+            )
+            return response
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+To short-circuit (e.g., reject unauthenticated requests):
+
+```swift
+struct APIKeyMiddleware: AsyncMiddleware {
+    func respond(to request: Request, chainingTo next: AsyncResponder) async throws -> Response {
+        guard request.headers.first(name: "X-API-Key") == "secret" else {
+            throw Abort(.unauthorized)
+        }
+        return try await next.respond(to: request)
+    }
+}
+```
+
+## Registering middleware
+
+### Global middleware
+
+Use `app.middleware.use(...)` to register middleware that applies to all routes. By default, `app.middleware` is pre-configured with `RouteLoggingMiddleware` and `ErrorMiddleware`:
+
+```swift
+// Appended at the end (default position)
+app.middleware.use(CORSMiddleware())
+
+// Inserted at the beginning — runs before all other middleware
+app.middleware.use(TracingMiddleware(), at: .beginning)
+```
+
+### Replacing the middleware stack
+
+You can replace the entire middleware configuration by assigning a new `Middlewares` value:
+
+```swift
+var middlewares = Middlewares()
+middlewares.use(TracingMiddleware(), at: .beginning)
+middlewares.use(CORSMiddleware())
+middlewares.use(ErrorMiddleware.default(environment: app.environment))
+app.middleware = middlewares
+```
+
+<Warning>
+  If you replace `app.middleware`, you lose the default `RouteLoggingMiddleware` and `ErrorMiddleware`. Re-add them explicitly if needed.
+</Warning>
+
+### Middleware scoped to route groups
+
+```swift
+let api = app.grouped(APIKeyMiddleware())
+api.get("private") { req in "Secret content" }
+
+// Multiple middleware
+app.group(AuthMiddleware(), RateLimitMiddleware()) { protected in
+    protected.post("orders") { req in /* ... */ }
+}
+```
+
+## Middleware order
+
+Middleware is applied in the order it is added. The first middleware in the stack handles the request first and the response last (like nested functions wrapping the handler).
+
+```swift
+// Execution order: A → B → handler → B → A
+app.middleware.use(MiddlewareA())
+app.middleware.use(MiddlewareB())
+```
+
+For route-group middleware, they are applied after the global middleware stack.
+
+---
+
+## Built-in middleware
+
+### `ErrorMiddleware`
+
+Catches all errors thrown in routes or downstream middleware and converts them to structured JSON responses. Added by default.
+
+```swift
+// The default instance, already registered:
+app.middleware.use(ErrorMiddleware.default(environment: app.environment))
+```
+
+`AbortError`-conforming types (including `Abort`) map to their HTTP status and reason:
+
+```swift
+throw Abort(.notFound, reason: "User not found")
+// → {"error": true, "reason": "User not found"} with 404 status
+```
+
+In release builds, unknown error details are hidden (`"Something went wrong."`).
+
+You can create a custom error middleware:
+
+```swift
+app.middleware.use(ErrorMiddleware { req, error in
+    // build and return a custom Response
+    return Response(status: .internalServerError, body: .init(string: "\(error)"))
+})
+```
+
+### `CORSMiddleware`
+
+Adds CORS response headers and handles preflight `OPTIONS` requests.
+
+```swift
+let corsConfig = CORSMiddleware.Configuration(
+    allowedOrigin: .all,
+    allowedMethods: [.GET, .POST, .PUT, .DELETE, .PATCH, .OPTIONS],
+    allowedHeaders: [.accept, .authorization, .contentType, .origin],
+    allowCredentials: false,
+    cacheExpiration: 600      // Access-Control-Max-Age in seconds
+)
+app.middleware.use(CORSMiddleware(configuration: corsConfig))
+```
+
+`AllowOriginSetting` options:
+
+| Case | Behaviour |
+|---|---|
+| `.none` | No origin allowed |
+| `.originBased` | Mirrors the request's `Origin` header |
+| `.all` | Wildcard `*` |
+| `.any([String])` | Allows specific origins |
+| `.custom(String)` | Fixed custom value |
+
+<Note>
+  Register `CORSMiddleware` **before** `ErrorMiddleware` so that even error responses include CORS headers.
+</Note>
+
+### `RouteLoggingMiddleware`
+
+Logs each request's method and path at the configured log level. Added by default at `.info`.
+
+```swift
+app.middleware.use(RouteLoggingMiddleware(logLevel: .debug))
+```
+
+### `FileMiddleware`
+
+Serves static files from a directory on disk. Files are streamed efficiently and support ETags for caching.
+
+```swift
+app.middleware.use(FileMiddleware(
+    publicDirectory: app.directory.publicDirectory,
+    defaultFile: "index.html",         // serve this file when a directory is requested
+    directoryAction: .redirect,        // redirect /foo to /foo/ when foo is a directory
+    advancedETagComparison: true,      // byte-level hash (slower, more accurate)
+    cachePolicy: .cacheUpToDuration(.minutes(5))
+))
+```
+
+<Tip>
+  `FileMiddleware` should generally be registered last so route handlers take precedence over static files.
+</Tip>
+
+### `ResponseCompressionMiddleware`
+
+Overrides the server-level response compression setting for a specific route group. Use it when compression is disabled globally but you want to enable it for a subset of routes (or vice versa).
+
+```swift
+// Enable compression for an API group
+let compressed = app.grouped(ResponseCompressionMiddleware(override: .enable))
+compressed.get("big-payload") { req in /* ... */ }
+
+// Or use the shorthand on RoutesBuilder
+app.responseCompression(.disable).get("media") { req in /* ... */ }
+```
+
+The `force` parameter overrides any compression preference set by the response itself:
+
+```swift
+ResponseCompressionMiddleware(override: .enable, force: true)
+```
+
+### `TracingMiddleware`
+
+Creates an OpenTelemetry-compatible distributed tracing span for each request. Follows the [OpenTelemetry HTTP semantic conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/).
+
+```swift
+app.middleware.use(TracingMiddleware())
+
+// With custom span attributes
+app.middleware.use(TracingMiddleware { attributes, request in
+    attributes["tenant.id"] = request.headers.first(name: "X-Tenant-ID")
+})
+```
+
+<Note>
+  `TracingMiddleware` requires a configured tracing backend (e.g., `swift-otel`). Without one, the middleware is a no-op.
+</Note>

@@ -1,0 +1,198 @@
+---
+title: "Sessions"
+description: "Store and retrieve session data across requests"
+---
+
+Sessions let you associate data with a specific client across multiple HTTP requests. Vapor stores a session identifier in an HTTP cookie and uses it to look up session data on each subsequent request.
+
+## How sessions work
+
+1. On the first request where `req.session` is accessed, a new `Session` object is created.
+2. After the response is sent, `SessionsMiddleware` persists the session data via the configured `SessionDriver` and sets a cookie on the response.
+3. On future requests, the middleware reads the cookie, looks up the session data, and restores it so `req.session` contains the previous values.
+4. When `session.destroy()` is called, the session is invalidated and the cookie is cleared.
+
+---
+
+## Setup
+
+<Steps>
+  <Step title="Configure a session driver">
+    In `configure.swift`, choose a session storage backend. The built-in in-memory driver is suitable for development and single-instance deployments:
+
+    ```swift
+    app.sessions.use(.memory)
+    ```
+
+    For production, use a persistent driver such as `vapor/redis` or `vapor-community/fluent-sessions`.
+  </Step>
+
+  <Step title="Add SessionsMiddleware">
+    Register the middleware globally so it applies to all routes:
+
+    ```swift
+    app.middleware.use(app.sessions.middleware)
+    ```
+
+    Or apply it to a specific route group:
+
+    ```swift
+    let sessionRoutes = app.grouped(app.sessions.middleware)
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Reading and writing session data
+
+`req.session` returns the `Session` for the current request. Session data is stored as `[String: String]` key-value pairs.
+
+```swift
+app.get("set") { req -> String in
+    req.session.data["username"] = "alice"
+    return "Session stored"
+}
+
+app.get("get") { req -> String in
+    let username = req.session.data["username"] ?? "anonymous"
+    return "Hello, \(username)"
+}
+```
+
+<Warning>
+  Accessing `req.session` without `SessionsMiddleware` in the middleware stack triggers an assertion failure at runtime. Make sure the middleware is applied before any route that uses sessions.
+</Warning>
+
+### Checking for an existing session
+
+Use `req.hasSession` to test whether a session was restored from the cookie before touching `req.session`:
+
+```swift
+app.get("status") { req -> String in
+    if req.hasSession {
+        return "Active session: \(req.session.id?.string ?? "new")"
+    }
+    return "No session"
+}
+```
+
+---
+
+## Destroying a session
+
+Call `session.destroy()` to invalidate the current session. `SessionsMiddleware` will delete the backing store entry and expire the cookie on the response.
+
+```swift
+app.post("logout") { req -> Response in
+    req.session.destroy()
+    return req.redirect(to: "/login")
+}
+```
+
+---
+
+## Session configuration
+
+`SessionsConfiguration` controls the cookie name and how cookie values are constructed. The defaults are:
+
+- Cookie name: `vapor-session`
+- Expiry: 7 days
+- `SameSite`: `.lax`
+- `isSecure`: `false`
+- `isHTTPOnly`: `false`
+
+Override the configuration before adding the middleware:
+
+```swift
+app.sessions.configuration = SessionsConfiguration(
+    cookieName: "my-app-session"
+) { sessionID in
+    HTTPCookies.Value(
+        string: sessionID.string,
+        expires: Date(timeIntervalSinceNow: 60 * 60 * 24 * 30), // 30 days
+        isSecure: true,
+        isHTTPOnly: true,
+        sameSite: .strict
+    )
+}
+
+app.middleware.use(app.sessions.middleware)
+```
+
+---
+
+## Custom session drivers
+
+Implement `SessionDriver` to persist sessions in any storage backend:
+
+```swift
+struct RedisSessionDriver: SessionDriver {
+    let redis: RedisClient
+
+    func createSession(_ data: SessionData, for request: Request) -> EventLoopFuture<SessionID> {
+        let id = SessionID(string: generateToken())
+        return redis
+            .set(id.string, to: encode(data))
+            .map { id }
+    }
+
+    func readSession(_ sessionID: SessionID, for request: Request) -> EventLoopFuture<SessionData?> {
+        redis
+            .get(sessionID.string, as: String.self)
+            .map { $0.flatMap(decode) }
+    }
+
+    func updateSession(_ sessionID: SessionID, to data: SessionData, for request: Request) -> EventLoopFuture<SessionID> {
+        redis
+            .set(sessionID.string, to: encode(data))
+            .map { sessionID }
+    }
+
+    func deleteSession(_ sessionID: SessionID, for request: Request) -> EventLoopFuture<Void> {
+        redis.delete(sessionID.string).map { _ in }
+    }
+}
+```
+
+For async drivers, conform to `AsyncSessionDriver` instead. It inherits from `SessionDriver` and provides default implementations that bridge to your async methods:
+
+```swift
+struct AsyncRedisSessionDriver: AsyncSessionDriver {
+    func createSession(_ data: SessionData, for request: Request) async throws -> SessionID { ... }
+    func readSession(_ sessionID: SessionID, for request: Request) async throws -> SessionData? { ... }
+    func updateSession(_ sessionID: SessionID, to data: SessionData, for request: Request) async throws -> SessionID { ... }
+    func deleteSession(_ sessionID: SessionID, for request: Request) async throws { ... }
+}
+```
+
+Register a custom driver:
+
+```swift
+app.sessions.use { app in
+    AsyncRedisSessionDriver(redis: app.redis)
+}
+```
+
+---
+
+## Session data
+
+`SessionData` is a `[String: String]` container with subscript access. Use `.snapshot` to get a plain dictionary copy for custom serialization:
+
+```swift
+// Write
+req.session.data["cart_id"] = cartID.uuidString
+
+// Read
+let cartID = req.session.data["cart_id"].flatMap(UUID.init)
+
+// Snapshot for custom serialization
+let raw: [String: String] = req.session.data.snapshot
+```
+
+---
+
+## Integration with authentication
+
+Sessions work alongside Vapor's session-based authenticators. See the [Authentication guide](/guides/authentication) for how `SessionAuthenticatable` stores and restores authenticated users across requests using `req.session`.

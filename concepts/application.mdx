@@ -1,0 +1,208 @@
+---
+title: "Application"
+description: "The Application type is the core of every Vapor app"
+---
+
+`Application` is a `final class` that owns the server, routing table, middleware stack, storage, and lifecycle of your Vapor process. Every other subsystem — HTTP server, client, sessions, views, passwords — hangs off of it.
+
+## Creating an application
+
+<Tabs>
+  <Tab title="Async (recommended)">
+    ```swift
+    import Vapor
+
+    @main
+    struct App {
+        static func main() async throws {
+            let app = try await Application.make(.development)
+            defer { try? await app.asyncShutdown() }
+
+            // configure routes, middleware, etc.
+            try await app.execute()
+        }
+    }
+    ```
+
+    `Application.make(_:_:)` is the preferred async initializer. It loads `.env` files and registers the default `serve` command automatically.
+  </Tab>
+  <Tab title="Sync (legacy)">
+    ```swift
+    import Vapor
+
+    var app = Application(.development)
+    defer { app.shutdown() }
+
+    try configure(app)
+    try app.run()
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The sync `Application.init` and `app.run()` APIs are deprecated. Prefer `Application.make` and `app.execute()` in new projects.
+</Note>
+
+## Environment
+
+`app.environment` is an `Environment` value that describes which runtime context your app is operating in.
+
+```swift
+switch app.environment {
+case .production:
+    app.logger.logLevel = .warning
+case .development:
+    app.logger.logLevel = .debug
+default:
+    break
+}
+```
+
+### Built-in environments
+
+| Property | Name | Notes |
+|---|---|---|
+| `.development` | `"development"` | Default when no `--env` flag is passed |
+| `.production` | `"production"` | Sets `isRelease` based on compile-time assertions |
+| `.testing` | `"testing"` | Strips Xcode / SwiftPM test runner arguments automatically |
+
+You can also detect the environment from command-line arguments:
+
+```swift
+let env = try Environment.detect()
+let app = try await Application.make(env)
+```
+
+Or create a custom environment:
+
+```swift
+let app = try await Application.make(.custom(name: "staging"))
+```
+
+### Reading environment variables
+
+```swift
+if let dbPassword = Environment.get("DB_PASSWORD") {
+    // use dbPassword
+}
+```
+
+`Environment.process` exposes a dynamic member lookup for process variables:
+
+```swift
+let port = Environment.process.PORT
+```
+
+## Storage
+
+`app.storage` is a type-keyed dictionary (`Storage`) for attaching custom services to the application without subclassing. Define a `StorageKey` conformance and use it as the subscript:
+
+```swift
+import Vapor
+
+struct MyServiceKey: StorageKey {
+    typealias Value = MyService
+}
+
+extension Application {
+    var myService: MyService {
+        get {
+            self.storage[MyServiceKey.self] ?? MyService()
+        }
+        set {
+            self.storage[MyServiceKey.self] = newValue
+        }
+    }
+}
+
+// In configure(_:):
+app.myService = MyService(config: ...)
+```
+
+You can register a shutdown closure that will be called when the application shuts down:
+
+```swift
+app.storage.set(MyServiceKey.self, to: service, onShutdown: { svc in
+    svc.close()
+})
+```
+
+## Lifecycle
+
+`app.lifecycle` holds a list of `LifecycleHandler` objects that are notified at boot and shutdown. Implement the protocol to run code at specific points in the application lifecycle:
+
+```swift
+struct DatabaseMigrator: LifecycleHandler {
+    func willBootAsync(_ app: Application) async throws {
+        app.logger.info("Running migrations…")
+        try await runMigrations(app)
+    }
+
+    func didBootAsync(_ app: Application) async throws {
+        app.logger.info("Migrations complete")
+    }
+
+    func shutdownAsync(_ app: Application) async {
+        app.logger.info("Closing database connections")
+        await closeConnections(app)
+    }
+}
+
+// Register the handler
+app.lifecycle.use(DatabaseMigrator())
+```
+
+`LifecycleHandler` provides default no-op implementations for every method, so you only need to implement what you care about.
+
+<Tip>
+  The async lifecycle methods (`willBootAsync`, `didBootAsync`, `shutdownAsync`) are only invoked when the app is initialised with `Application.make`. The sync counterparts (`willBoot`, `didBoot`, `shutdown`) are used as fallbacks.
+</Tip>
+
+## Logger
+
+`app.logger` is a `swift-log` `Logger` labelled `"codes.vapor.application"`. You can swap it with your own logger:
+
+```swift
+import Logging
+
+var logger = Logger(label: "com.myapp")
+logger.logLevel = .debug
+app.logger = logger
+```
+
+Log messages inside route handlers should use `req.logger`, which carries request-scoped metadata (including the request ID).
+
+## Shutting down
+
+<Steps>
+  <Step title="Graceful async shutdown">
+    ```swift
+    try await app.asyncShutdown()
+    ```
+
+    Calls all registered lifecycle shutdown handlers in reverse registration order, drains the storage (invoking any shutdown closures), and optionally shuts down the `EventLoopGroup` if it was created by Vapor.
+  </Step>
+  <Step title="Sync shutdown (legacy)">
+    ```swift
+    app.shutdown()
+    ```
+
+    Equivalent sync version. Prefer the async variant in new code.
+  </Step>
+</Steps>
+
+<Warning>
+  Always shut down your application before it is deinitialized. If `shutdown()` / `asyncShutdown()` is not called, `Application.deinit` will log an error and attempt a sync shutdown.
+</Warning>
+
+## Starting the server
+
+```swift
+// Runs the default "serve" command and blocks until the server stops.
+try await app.execute()
+
+// Or: start without blocking (you must prevent exit yourself).
+try await app.startup()
+```
+
+The underlying HTTP server, port, hostname, and TLS configuration are all controlled through `app.http.server.configuration`.

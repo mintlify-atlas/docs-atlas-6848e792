@@ -1,0 +1,229 @@
+---
+title: "WebSockets"
+description: "Add real-time WebSocket connections to your Vapor app"
+---
+
+Vapor supports WebSocket connections through the `webSocket` route builder method. When a client sends an HTTP upgrade request, Vapor performs the handshake and hands you a `WebSocket` object for the duration of the connection.
+
+## Registering a WebSocket route
+
+Use `webSocket(_:onUpgrade:)` on any `RoutesBuilder`. The `onUpgrade` closure receives the original `Request` and the live `WebSocket`:
+
+```swift
+app.webSocket("echo") { req, ws in
+    ws.onText { ws, text in
+        ws.send(text) // echo back
+    }
+}
+```
+
+This registers a `GET /echo` endpoint. Clients connect using a standard WebSocket URL (`ws://host/echo` or `wss://host/echo` for TLS).
+
+---
+
+## WebSocket callbacks
+
+The `WebSocket` object exposes closures for each type of incoming frame:
+
+<Tabs>
+  <Tab title="Text">
+    ```swift
+    ws.onText { ws, text in
+        print("Received: \(text)")
+        ws.send("You said: \(text)")
+    }
+    ```
+  </Tab>
+  <Tab title="Binary">
+    ```swift
+    ws.onBinary { ws, buffer in
+        print("Received \(buffer.readableBytes) bytes")
+        ws.send(raw: buffer, opcode: .binary)
+    }
+    ```
+  </Tab>
+  <Tab title="Close">
+    ```swift
+    ws.onClose.whenComplete { result in
+        switch result {
+        case .success:
+            print("Connection closed cleanly")
+        case .failure(let error):
+            print("Connection closed with error: \(error)")
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Ping / Pong">
+    ```swift
+    ws.onPing { ws, buffer in
+        // Vapor responds to pings automatically; use this for custom logic
+        print("Ping received")
+    }
+
+    ws.onPong { ws, buffer in
+        print("Pong received")
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Sending messages
+
+```swift
+// Send a text frame
+ws.send("Hello, client!")
+
+// Send a text string built from a closure result
+ws.send("Status: \(status)")
+
+// Send raw bytes (e.g., binary data)
+ws.send(raw: data, opcode: .binary)
+```
+
+---
+
+## Closing a connection
+
+Call `ws.close()` to initiate a clean shutdown from the server side:
+
+```swift
+ws.onText { ws, text in
+    if text == "quit" {
+        ws.close(code: .normalClosure)
+    }
+}
+```
+
+---
+
+## Max frame size
+
+By default, Vapor accepts WebSocket frames up to `1 << 14` bytes (16 KB). Override this per-route with the `maxFrameSize` parameter:
+
+```swift
+app.webSocket("upload", maxFrameSize: 1 << 20) { req, ws in // 1 MB
+    ws.onBinary { ws, data in
+        // handle large binary frame
+    }
+}
+```
+
+---
+
+## Controlling the upgrade with `shouldUpgrade`
+
+Provide a `shouldUpgrade` closure to inspect the request before the WebSocket handshake completes. Return an `EventLoopFuture<HTTPHeaders?>` — non-`nil` headers to include in the `101 Switching Protocols` response, or `nil` to reject the upgrade (responds with 400):
+
+```swift
+app.webSocket(
+    "chat",
+    shouldUpgrade: { req in
+        // Require a valid token before upgrading
+        guard req.headers.bearerAuthorization != nil else {
+            return req.eventLoop.makeSucceededFuture(nil) // Reject
+        }
+        return req.eventLoop.makeSucceededFuture([:]) // Allow with no extra headers
+    },
+    onUpgrade: { req, ws in
+        ws.onText { ws, message in
+            ws.send("Echo: \(message)")
+        }
+    }
+)
+```
+
+---
+
+## Upgrading inside a route handler
+
+You can also perform the upgrade manually from a regular route handler using `req.webSocket(onUpgrade:)`. This is useful when you need to run async code before deciding whether to upgrade:
+
+```swift
+app.get("live") { req -> Response in
+    req.webSocket { req, ws in
+        ws.onText { ws, text in
+            ws.send(text)
+        }
+    }
+}
+```
+
+---
+
+## Example: echo server
+
+```swift
+app.webSocket("echo") { req, ws in
+    print("Client connected: \(req.remoteAddress?.description ?? "unknown")")
+
+    ws.onText { ws, text in
+        ws.send(text)
+    }
+
+    ws.onBinary { ws, buffer in
+        ws.send(raw: buffer, opcode: .binary)
+    }
+
+    ws.onClose.whenComplete { _ in
+        print("Client disconnected")
+    }
+}
+```
+
+---
+
+## Example: broadcast pattern
+
+Use an actor (or `NIOLockedValueBox`) to share a list of connected clients safely across concurrent connections:
+
+```swift
+actor ChatRoom {
+    var clients: [WebSocket] = []
+
+    func add(_ ws: WebSocket) {
+        clients.append(ws)
+    }
+
+    func remove(_ ws: WebSocket) {
+        clients.removeAll { $0 === ws }
+    }
+
+    func broadcast(_ message: String) {
+        for client in clients {
+            client.send(message)
+        }
+    }
+}
+
+let room = ChatRoom()
+
+app.webSocket("chat") { req, ws in
+    await room.add(ws)
+
+    ws.onText { ws, message in
+        await room.broadcast(message)
+    }
+
+    ws.onClose.whenComplete { _ in
+        await room.remove(ws)
+    }
+}
+```
+
+---
+
+## Route groups
+
+WebSocket routes participate in route groups and inherit middleware just like regular routes:
+
+```swift
+let authenticated = app.grouped(TokenAuthenticator(), User.guardMiddleware())
+
+authenticated.webSocket("notifications") { req, ws in
+    let user = try req.auth.require(User.self)
+    ws.send("Connected as \(user.email)")
+}
+```

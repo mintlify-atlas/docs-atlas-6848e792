@@ -1,0 +1,322 @@
+---
+title: "Authentication"
+description: "Add Basic, Bearer, and session-based authentication to your Vapor app"
+---
+
+Vapor's authentication system is built around the `Authenticator` protocol. Authenticators are middleware that inspect incoming requests for credentials, look up the associated user, and store the result in `req.auth` for your route handlers to access.
+
+## Core concepts
+
+### The `Authenticatable` protocol
+
+Any type you want to authenticate must conform to `Authenticatable`:
+
+```swift
+struct User: Authenticatable {
+    var id: UUID
+    var email: String
+    var passwordHash: String
+}
+```
+
+### Reading the authenticated user
+
+Inside a route handler, use `req.auth` to retrieve the authenticated instance:
+
+| Method | Behavior |
+|---|---|
+| `req.auth.get(User.self)` | Returns `User?` — `nil` if not authenticated |
+| `req.auth.require(User.self)` | Returns `User` or throws `401 Unauthorized` |
+| `req.auth.has(User.self)` | Returns `Bool` |
+| `req.auth.login(user)` | Stores a user as authenticated for this request |
+| `req.auth.logout(User.self)` | Removes the user from the auth cache |
+
+---
+
+## Basic authentication
+
+`BasicAuthenticator` (or `AsyncBasicAuthenticator` for async handlers) reads the `Authorization: Basic ...` header. The header value is a base64-encoded `username:password` string, parsed into a `BasicAuthorization` value.
+
+<Steps>
+  <Step title="Implement the authenticator">
+    ```swift
+    struct UserAuthenticator: AsyncBasicAuthenticator {
+        func authenticate(basic: BasicAuthorization, for request: Request) async throws {
+            // Look up the user by username
+            guard let user = try await User.query(on: request.db)
+                .filter(\.$email == basic.username)
+                .first()
+            else {
+                return // User not found — do not call req.auth.login
+            }
+
+            // Verify the password
+            guard try request.password.verify(basic.password, created: user.passwordHash) else {
+                return // Wrong password — do not throw, just return
+            }
+
+            request.auth.login(user)
+        }
+    }
+    ```
+
+    <Note>
+      Do not throw an error if credentials are invalid. Simply return without calling `req.auth.login(_:)`. Errors should only be thrown for unexpected failures (e.g., a database error).
+    </Note>
+  </Step>
+
+  <Step title="Apply the middleware and protect routes">
+    ```swift
+    let protected = app.grouped(UserAuthenticator())
+        .grouped(User.guardMiddleware())
+
+    protected.get("me") { req -> User in
+        try req.auth.require(User.self)
+    }
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Bearer authentication
+
+`BearerAuthenticator` (or `AsyncBearerAuthenticator`) reads the `Authorization: Bearer <token>` header, making the token available as a `BearerAuthorization` value.
+
+```swift
+struct TokenAuthenticator: AsyncBearerAuthenticator {
+    func authenticate(bearer: BearerAuthorization, for request: Request) async throws {
+        guard let token = try await Token.query(on: request.db)
+            .filter(\.$value == bearer.token)
+            .with(\.$user)
+            .first()
+        else {
+            return
+        }
+
+        request.auth.login(token.user)
+    }
+}
+```
+
+Apply it the same way as a basic authenticator:
+
+```swift
+let api = app.grouped(TokenAuthenticator(), User.guardMiddleware())
+
+api.get("profile") { req -> User in
+    try req.auth.require(User.self)
+}
+```
+
+---
+
+## Credentials authentication
+
+`CredentialsAuthenticator` (or `AsyncCredentialsAuthenticator`) reads credentials from the request body rather than a header. You define the `Credentials` type — Vapor decodes it automatically.
+
+```swift
+struct LoginCredentials: Content {
+    let email: String
+    let password: String
+}
+
+struct CredentialsAuthenticator: AsyncCredentialsAuthenticator {
+    typealias Credentials = LoginCredentials
+
+    func authenticate(credentials: LoginCredentials, for request: Request) async throws {
+        guard let user = try await User.query(on: request.db)
+            .filter(\.$email == credentials.email)
+            .first()
+        else {
+            return
+        }
+
+        guard try request.password.verify(credentials.password, created: user.passwordHash) else {
+            return
+        }
+
+        request.auth.login(user)
+    }
+}
+```
+
+---
+
+## Session-based authentication
+
+Session authentication persists the user's identity across requests using cookies. It requires `SessionsMiddleware` to be active.
+
+Your model must conform to `SessionAuthenticatable`, providing a `sessionID` that can be stored as a string:
+
+```swift
+extension User: SessionAuthenticatable {
+    var sessionID: UUID { self.id }
+}
+```
+
+Then implement `AsyncSessionAuthenticator` to look up a user by the stored session ID:
+
+```swift
+struct UserSessionAuthenticator: AsyncSessionAuthenticator {
+    typealias User = App.User
+
+    func authenticate(sessionID: UUID, for request: Request) async throws {
+        guard let user = try await User.find(sessionID, on: request.db) else {
+            return
+        }
+        request.auth.login(user)
+    }
+}
+```
+
+When a user logs in, call `req.auth.login(user)` — the session authenticator automatically stores the `sessionID` in the session. On subsequent requests it reads the session, calls `authenticate(sessionID:for:)`, and restores the user. When `req.auth.logout(User.self)` is called, the session entry is cleared.
+
+```swift
+// Login route (outside protected group)
+app.post("login") { req -> Response in
+    // Use CredentialsAuthenticator on this route group, or authenticate manually:
+    let credentials = try req.content.decode(LoginCredentials.self)
+    guard let user = try await User.query(on: req.db)
+        .filter(\.$email == credentials.email)
+        .first(),
+        try req.password.verify(credentials.password, created: user.passwordHash)
+    else {
+        throw Abort(.unauthorized)
+    }
+    req.auth.login(user)
+    return req.redirect(to: "/dashboard")
+}
+
+// Logout route
+app.post("logout") { req -> Response in
+    req.auth.logout(User.self)
+    return req.redirect(to: "/login")
+}
+```
+
+---
+
+## Protecting routes
+
+### `guardMiddleware()`
+
+`GuardMiddleware` ensures a user has been authenticated by a previous middleware in the chain. If no authenticated user is found, it throws a `401 Unauthorized` error (configurable).
+
+```swift
+// Use the default 401 error
+app.grouped(UserAuthenticator(), User.guardMiddleware())
+    .get("secure") { req in "You're authenticated" }
+
+// Use a custom error
+app.grouped(UserAuthenticator(), User.guardMiddleware(throwing: Abort(.forbidden)))
+    .get("admin") { req in "Admins only" }
+```
+
+### `redirectMiddleware(path:)`
+
+`RedirectMiddleware` redirects unauthenticated requests to a login page instead of throwing an error. Useful for browser-facing apps.
+
+```swift
+app.grouped(
+    app.sessions.middleware,
+    UserSessionAuthenticator(),
+    User.redirectMiddleware(path: "/login")
+)
+.get("dashboard") { req -> View in
+    let user = try req.auth.require(User.self)
+    return try await req.view.render("dashboard", ["user": user])
+}
+```
+
+You can also provide a closure to compute the redirect path dynamically based on the request:
+
+```swift
+User.redirectMiddleware { req in
+    "/login?next=\(req.url.path)"
+}
+```
+
+---
+
+## Password hashing
+
+Vapor ships with Bcrypt support. Configure it in `configure.swift`:
+
+```swift
+app.passwords.use(.bcrypt)
+```
+
+The default cost is 12. To customize:
+
+```swift
+app.passwords.use(.bcrypt(cost: 10))
+```
+
+Use `req.password` in route handlers:
+
+```swift
+// Hash a plaintext password
+let hash = try req.password.hash("hunter2")
+
+// Verify a plaintext password against a stored hash
+let isValid = try req.password.verify("hunter2", created: storedHash)
+```
+
+For async contexts, use `req.password.async`:
+
+```swift
+let hash = try await req.password.async.hash("hunter2")
+let isValid = try await req.password.async.verify("hunter2", created: storedHash)
+```
+
+---
+
+## Complete example
+
+The following shows a complete user registration and login flow using Basic authentication.
+
+```swift
+// User+Auth.swift
+import Vapor
+
+struct User: Authenticatable {
+    var id: UUID
+    var email: String
+    var passwordHash: String
+}
+
+struct UserBasicAuthenticator: AsyncBasicAuthenticator {
+    func authenticate(basic: BasicAuthorization, for request: Request) async throws {
+        guard let user = try await User.query(on: request.db)
+            .filter(\.$email == basic.username)
+            .first()
+        else { return }
+
+        guard try request.password.verify(basic.password, created: user.passwordHash) else {
+            return
+        }
+
+        request.auth.login(user)
+    }
+}
+
+// routes.swift
+func routes(_ app: Application) throws {
+    // Public registration endpoint
+    app.post("register") { req async throws -> HTTPStatus in
+        let input = try req.content.decode(RegisterRequest.self)
+        let hash = try await req.password.async.hash(input.password)
+        let user = User(id: .init(), email: input.email, passwordHash: hash)
+        try await user.save(on: req.db)
+        return .created
+    }
+
+    // Protected routes
+    let protected = app.grouped(UserBasicAuthenticator(), User.guardMiddleware())
+
+    protected.get("me") { req -> User in
+        try req.auth.require(User.self)
+    }
+}
+```

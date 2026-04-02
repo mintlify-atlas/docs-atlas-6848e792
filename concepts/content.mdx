@@ -1,0 +1,267 @@
+---
+title: "Content"
+description: "Encode and decode request and response bodies using Swift's Codable"
+---
+
+Vapor's content system bridges Swift's `Codable` protocol and HTTP message bodies. It automatically selects the right encoder or decoder based on the `Content-Type` header, supports JSON, URL-encoded forms, and multipart data out of the box, and is fully configurable.
+
+## The `Content` protocol
+
+`Content` extends `Codable` and adds request decoding and response encoding capabilities:
+
+```swift
+public protocol Content: Codable, RequestDecodable, ResponseEncodable, Sendable {
+    static var defaultContentType: HTTPMediaType { get }
+    mutating func beforeEncode() throws
+    mutating func afterDecode() throws
+}
+```
+
+The default implementations encode as JSON and are no-ops for `beforeEncode` / `afterDecode`. Define a struct (or class) conforming to `Content` to use it as a request body or response:
+
+```swift
+struct User: Content {
+    var id: UUID
+    var name: String
+    var email: String
+}
+```
+
+That's all you need. Vapor automatically JSON-encodes `User` when returned from a route and JSON-decodes it from request bodies.
+
+### Lifecycle hooks
+
+Override `beforeEncode` and `afterDecode` to sanitize or validate data:
+
+```swift
+struct CreateUserRequest: Content {
+    var name: String
+    var email: String
+
+    mutating func afterDecode() throws {
+        name = name.trimmingCharacters(in: .whitespaces)
+        guard name.count >= 2 else {
+            throw Abort(.badRequest, reason: "Name must be at least 2 characters")
+        }
+    }
+}
+```
+
+## Decoding request bodies
+
+Use `req.content.decode(_:)` to decode the incoming body. Vapor chooses the decoder based on the request's `Content-Type` header:
+
+```swift
+app.post("users") { req async throws -> User in
+    let input = try req.content.decode(CreateUserRequest.self)
+    let user = User(id: UUID(), name: input.name, email: input.email)
+    return user
+}
+```
+
+### JSON
+
+```swift
+// POST /login  Content-Type: application/json
+// Body: {"email":"alice@example.com","password":"secret"}
+
+struct LoginRequest: Content {
+    var email: String
+    var password: String
+}
+
+app.post("login") { req async throws -> HTTPStatus in
+    let login = try req.content.decode(LoginRequest.self)
+    // validate credentials...
+    return .ok
+}
+```
+
+### URL-encoded form
+
+```swift
+// POST /register  Content-Type: application/x-www-form-urlencoded
+// Body: name=Alice&email=alice%40example.com
+
+struct RegistrationForm: Content {
+    var name: String
+    var email: String
+}
+
+app.post("register") { req async throws -> HTTPStatus in
+    let form = try req.content.decode(RegistrationForm.self)
+    return .created
+}
+```
+
+### Multipart form data
+
+```swift
+// POST /upload  Content-Type: multipart/form-data
+
+struct UploadForm: Content {
+    var description: String
+    var file: File
+}
+
+app.post("upload") { req async throws -> HTTPStatus in
+    let form = try req.content.decode(UploadForm.self)
+    let filename = form.file.filename
+    let data = form.file.data
+    return .ok
+}
+```
+
+### Decode as a specific content type
+
+You can override the content type used for decoding:
+
+```swift
+let payload = try req.content.decode(MyType.self, as: .json)
+```
+
+## Encoding response bodies
+
+Return a `Content`-conforming type directly from a route handler. Vapor encodes it using the type's `defaultContentType` (JSON by default):
+
+```swift
+app.get("users", ":id") { req async throws -> User in
+    let id = try req.parameters.require("id", as: UUID.self)
+    return User(id: id, name: "Alice", email: "alice@example.com")
+}
+// Response: {"id":"...","name":"Alice","email":"alice@example.com"}
+// Content-Type: application/json
+```
+
+To encode as a specific content type:
+
+```swift
+app.get("greet") { req async throws -> Response in
+    let greeting = Greeting(message: "Hello!")
+    let res = Response()
+    try res.content.encode(greeting, as: .json)
+    return res
+}
+```
+
+### Customising the default content type
+
+```swift
+struct FormPayload: Content {
+    static let defaultContentType: HTTPMediaType = .urlEncodedForm
+    var name: String
+    var value: String
+}
+```
+
+## Reading query parameters
+
+Use `req.query` (a `URLQueryContainer`) to access URL query parameters:
+
+```swift
+// GET /search?q=vapor&limit=10
+
+struct SearchQuery: Content {
+    var q: String
+    var limit: Int = 20
+}
+
+app.get("search") { req async throws -> [Result] in
+    let query = try req.query.decode(SearchQuery.self)
+    return try await performSearch(query.q, limit: query.limit)
+}
+```
+
+Access individual keys without decoding a struct:
+
+```swift
+let term = try req.query.get(String.self, at: "q")
+let page = req.query[Int.self, at: "page"] ?? 1
+```
+
+## Accessing nested fields
+
+Use subscript or `get(at:)` to read a single value at a coding key path without decoding the entire body:
+
+```swift
+// Body: {"user": {"name": "Alice"}}
+let name: String? = req.content[at: "user", "name"]
+
+// Throwing version
+let name: String = try req.content.get(at: "user", "name")
+```
+
+## `ContentConfiguration`
+
+`ContentConfiguration.global` holds the application-wide registry of encoders and decoders, keyed by `HTTPMediaType`.
+
+### Default configuration
+
+Out of the box, Vapor registers:
+
+| Media type | Encoder | Decoder |
+|---|---|---|
+| `application/json` | `JSONEncoder` (ISO 8601 dates) | `JSONDecoder` (ISO 8601 dates) |
+| `application/vnd.api+json` | Same as JSON | Same as JSON |
+| `text/plain` | `PlaintextEncoder` | `PlaintextDecoder` |
+| `text/html` | `PlaintextEncoder` | — |
+| `application/x-www-form-urlencoded` | `URLEncodedFormEncoder` | `URLEncodedFormDecoder` |
+| `multipart/form-data` | `FormDataEncoder` | `FormDataDecoder` |
+
+### Customising JSON encoding
+
+Replace the global JSON encoder to change date format, key strategy, or output formatting:
+
+```swift
+// Use milliseconds since epoch instead of ISO 8601
+ContentConfiguration.global.use(
+    encoder: JSONEncoder.custom(dates: .millisecondsSince1970),
+    for: .json
+)
+ContentConfiguration.global.use(
+    decoder: JSONDecoder.custom(dates: .millisecondsSince1970),
+    for: .json
+)
+```
+
+Use snake_case keys:
+
+```swift
+ContentConfiguration.global.use(
+    encoder: JSONEncoder.custom(keys: .convertToSnakeCase),
+    for: .json
+)
+ContentConfiguration.global.use(
+    decoder: JSONDecoder.custom(keys: .convertFromSnakeCase),
+    for: .json
+)
+```
+
+Pretty-print JSON (useful in development):
+
+```swift
+ContentConfiguration.global.use(
+    encoder: JSONEncoder.custom(format: .prettyPrinted),
+    for: .json
+)
+```
+
+### Registering a custom encoder/decoder
+
+Implement `ContentEncoder` or `ContentDecoder` and register it for a media type:
+
+```swift
+struct MessagePackEncoder: ContentEncoder {
+    func encode<E: Encodable>(_ encodable: E, to body: inout ByteBuffer, headers: inout HTTPHeaders) throws {
+        headers.contentType = HTTPMediaType(type: "application", subType: "msgpack")
+        // encode into body...
+    }
+}
+
+let msgpackType = HTTPMediaType(type: "application", subType: "msgpack")
+ContentConfiguration.global.use(encoder: MessagePackEncoder(), for: msgpackType)
+```
+
+<Note>
+  Modify `ContentConfiguration.global` before the application starts. Changes made after boot may not be reflected consistently across event loops.
+</Note>

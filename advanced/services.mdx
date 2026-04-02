@@ -1,0 +1,266 @@
+---
+title: "Services"
+description: "Register and resolve custom services in your Vapor application"
+keywords: ["vapor", "services", "dependency injection", "storage", "lifecycle", "StorageKey"]
+---
+
+Vapor uses a lightweight dependency-injection pattern built around `Application.Storage`. Instead of a
+formal service container, you store values on `app.storage` using type-safe keys and expose them
+through computed properties on `Application` or `Request`.
+
+## Application storage
+
+`Application.Storage` is a dictionary keyed by `ObjectIdentifier`. Every entry is associated with
+an optional shutdown closure that runs when the application shuts down.
+
+```swift
+public struct Storage: Sendable {
+    public subscript<Key>(_ key: Key.Type) -> Key.Value?
+        where Key: StorageKey { get set }
+
+    public func get<Key>(_ key: Key.Type) -> Key.Value?
+        where Key: StorageKey
+
+    public mutating func set<Key>(
+        _ key: Key.Type,
+        to value: Key.Value?,
+        onShutdown: (@Sendable (Key.Value) throws -> ())? = nil
+    ) where Key: StorageKey
+}
+```
+
+Read and write values directly through the subscript:
+
+```swift
+app.storage[MyKey.self] = myValue
+let value = app.storage[MyKey.self]
+```
+
+## The `StorageKey` protocol
+
+Every stored value needs a unique key type. Conform a private or internal type to `StorageKey` and
+declare the associated `Value` type:
+
+```swift
+private struct MyServiceKey: StorageKey {
+    typealias Value = MyService
+}
+```
+
+`Storage` looks up values using `ObjectIdentifier(Key.self)`, so two distinct types that share the
+same `Value` type still map to independent slots.
+
+## Extending `Application` with a custom service
+
+The idiomatic way to expose a service is to extend `Application` with a computed property backed by
+`app.storage`:
+
+```swift
+import Vapor
+
+final class CounterService: Sendable {
+    private let counter = NIOLockedValueBox(0)
+
+    func increment() { counter.withLockedValue { $0 += 1 } }
+    func value() -> Int { counter.withLockedValue { $0 } }
+}
+
+extension Application {
+    private struct CounterKey: StorageKey {
+        typealias Value = CounterService
+    }
+
+    var counter: CounterService {
+        get {
+            if let existing = self.storage[CounterKey.self] {
+                return existing
+            }
+            let new = CounterService()
+            self.storage[CounterKey.self] = new
+            return new
+        }
+        set {
+            self.storage[CounterKey.self] = newValue
+        }
+    }
+}
+```
+
+Register it in `configure(_:)`:
+
+```swift
+public func configure(_ app: Application) throws {
+    // The counter is lazily created on first access.
+    app.counter.increment()
+}
+```
+
+Access it from a route:
+
+```swift
+app.get("count") { req in
+    "\(req.application.counter.value())"
+}
+```
+
+## Request-scoped services
+
+For services that are cheaper to compute per-request, extend `Request` instead. `Request` exposes
+its own `services` namespace through `Req+Service.swift`:
+
+```swift
+extension Request {
+    public struct Services {
+        public let request: Request
+    }
+    public var services: Services { Services(request: self) }
+}
+```
+
+Add a computed property:
+
+```swift
+extension Request.Services {
+    var weatherClient: WeatherClient {
+        WeatherClient(httpClient: self.request.client, logger: self.request.logger)
+    }
+}
+```
+
+Use it inside a route handler:
+
+```swift
+app.get("weather") { req async throws -> WeatherResponse in
+    try await req.services.weatherClient.current(city: "London")
+}
+```
+
+## The `Application.Service` generic wrapper
+
+For services that are configured via a provider pattern (similar to how Vapor configures its built-in
+servers and caches), use `Application.Service<ServiceType>`:
+
+```swift
+// Application.Service wraps a factory closure stored in app.storage.
+public struct Service<ServiceType> {
+    public struct Provider {
+        public init(_ run: @escaping @Sendable (Application) -> ())
+    }
+
+    public var service: ServiceType { get }
+    public func use(_ makeService: @escaping @Sendable (Application) -> ServiceType)
+    public func use(_ provider: Provider)
+}
+```
+
+<Note>
+`Application.Service` is used by Vapor's own subsystems (caches, clients, responders). For most
+application-level services the direct `StorageKey` approach shown above is simpler and preferred.
+</Note>
+
+## Service lifecycle
+
+`Application.Lifecycle` holds an ordered list of `LifecycleHandler` values. Each handler receives
+callbacks before and after the application boots and when it shuts down.
+
+### `LifecycleHandler` protocol
+
+```swift
+public protocol LifecycleHandler: Sendable {
+    func willBoot(_ application: Application) throws
+    func didBoot(_ application: Application) throws
+    func shutdown(_ application: Application)
+
+    // Async variants — called when the app is started with Application.make(_:_:)
+    func willBootAsync(_ application: Application) async throws
+    func didBootAsync(_ application: Application) async throws
+    func shutdownAsync(_ application: Application) async
+}
+```
+
+All methods have default no-op implementations, so you only need to implement the hooks you care about.
+
+### Registering a handler
+
+```swift
+struct DatabaseLifecycleHandler: LifecycleHandler {
+    func didBootAsync(_ application: Application) async throws {
+        application.logger.info("Running database migrations…")
+        try await application.db.autoMigrate()
+    }
+
+    func shutdownAsync(_ application: Application) async {
+        application.logger.info("Closing database connections…")
+        await application.db.shutdown()
+    }
+}
+
+// In configure(_:)
+app.lifecycle.use(DatabaseLifecycleHandler())
+```
+
+Handlers are called in registration order during boot and in **reverse** order during shutdown.
+
+### Example: a connection-pool service
+
+<Steps>
+  <Step title="Define the service">
+    ```swift
+    final class ConnectionPool: Sendable {
+        func connect() async throws { /* … */ }
+        func disconnect() async { /* … */ }
+    }
+    ```
+  </Step>
+  <Step title="Add storage support">
+    ```swift
+    extension Application {
+        private struct PoolKey: StorageKey {
+            typealias Value = ConnectionPool
+        }
+
+        var pool: ConnectionPool {
+            get { self.storage[PoolKey.self]! }
+            set { self.storage[PoolKey.self] = newValue }
+        }
+    }
+    ```
+  </Step>
+  <Step title="Create a lifecycle handler">
+    ```swift
+    struct PoolLifecycleHandler: LifecycleHandler {
+        func willBootAsync(_ application: Application) async throws {
+            let pool = ConnectionPool()
+            try await pool.connect()
+            application.pool = pool
+        }
+
+        func shutdownAsync(_ application: Application) async {
+            await application.pool.disconnect()
+        }
+    }
+    ```
+  </Step>
+  <Step title="Register it">
+    ```swift
+    // configure.swift
+    public func configure(_ app: Application) throws {
+        app.lifecycle.use(PoolLifecycleHandler())
+    }
+    ```
+  </Step>
+</Steps>
+
+## Storage shutdown closures
+
+When a value is registered with a shutdown closure it is called automatically during
+`app.asyncShutdown()`:
+
+```swift
+await app.storage.setWithAsyncShutdown(MyKey.self, to: myValue) { value in
+    await value.close()
+}
+```
+
+This is the mechanism Vapor uses internally to clean up built-in services (HTTP server, caches, etc.)
+without requiring explicit teardown code in your `configure` function.

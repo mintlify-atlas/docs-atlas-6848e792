@@ -1,0 +1,326 @@
+---
+title: "Deployment"
+description: "Deploy your Vapor application to production"
+keywords: ["vapor", "deployment", "docker", "production", "TLS", "HTTPS", "linux", "environment"]
+---
+
+Vapor applications are standard Swift executables and can be deployed anywhere Swift runs. This page
+covers the most common production deployment patterns.
+
+## Production environment
+
+Vapor's `Environment` type identifies the runtime context of your application. Pass `.production`
+(or set the `VAPOR_ENV=production` environment variable) to enable production defaults:
+
+```swift
+let app = try await Application.make(.production)
+```
+
+You can also pass `--env production` on the command line:
+
+```bash
+./Run serve --env production
+```
+
+In production, Vapor sets the default log level to `.notice` instead of `.info`, reducing log
+volume. The `isRelease` property is determined by the Swift build configuration (debug vs. release),
+not by the environment name.
+
+## Building for release
+
+Always build with the release configuration for production deployments:
+
+```bash
+swift build -c release
+```
+
+The compiled binary is placed in `.build/release/<TargetName>`. Run it directly:
+
+```bash
+.build/release/Run serve --env production
+```
+
+## Configuring hostname and port
+
+Set the hostname and port on `app.http.server.configuration` before the server starts:
+
+```swift
+// configure.swift
+public func configure(_ app: Application) throws {
+    app.http.server.configuration.hostname = "0.0.0.0"
+    app.http.server.configuration.port = 8080
+}
+```
+
+You can also override them at the command line:
+
+```bash
+./Run serve --hostname 0.0.0.0 --port 8080
+# or using the bind shorthand:
+./Run serve --bind 0.0.0.0:8080
+```
+
+`HTTPServer.Configuration` defaults:
+
+| Property | Default |
+|----------|---------|
+| `hostname` | `127.0.0.1` |
+| `port` | `8080` |
+| `backlog` | `256` |
+| `reuseAddress` | `true` |
+| `tcpNoDelay` | `true` |
+| `shutdownTimeout` | `.seconds(10)` |
+
+## Environment variable configuration
+
+Read secrets and configuration from the process environment using `Environment.get(_:)` or the
+`Environment.process` dynamic member lookup:
+
+```swift
+// Read a required secret
+guard let dbURL = Environment.get("DATABASE_URL") else {
+    fatalError("DATABASE_URL is not set")
+}
+
+// Read an optional value with a fallback
+let logLevel = Environment.process.LOG_LEVEL ?? .notice
+app.logger.logLevel = logLevel
+```
+
+Vapor also loads `.env` files automatically via `DotEnvFile.load` during app initialisation.
+Create a `.env.production` file for production-specific values and a `.env` file for shared defaults.
+
+<Warning>
+Never commit `.env` files containing secrets to source control. Add them to `.gitignore`.
+</Warning>
+
+## TLS / HTTPS
+
+Vapor uses SwiftNIO SSL (`NIOSSL`) to terminate TLS. Configure `tlsConfiguration` on the HTTP
+server before boot:
+
+```swift
+import NIOSSL
+
+public func configure(_ app: Application) throws {
+    let certChain = try NIOSSLCertificate.fromPEMFile("/etc/ssl/certs/server.pem")
+        .map { NIOSSLCertificateSource.certificate($0) }
+    let privateKey = try NIOSSLPrivateKey(file: "/etc/ssl/private/server.key", format: .pem)
+
+    app.http.server.configuration.port = 443
+    app.http.server.configuration.tlsConfiguration = try .makeServerConfiguration(
+        certificateChain: certChain,
+        privateKey: .privateKey(privateKey)
+    )
+}
+```
+
+When a `tlsConfiguration` is set, Vapor automatically enables HTTP/2 alongside HTTP/1.1 via ALPN
+negotiation. The address description logged at startup reflects the scheme:
+
+```
+Server started on https://0.0.0.0:443
+```
+
+<Note>
+In most production setups TLS is terminated at a reverse proxy (nginx, Caddy, AWS ALB, etc.) and
+Vapor listens on plain HTTP internally. Use Vapor's built-in TLS only when the process terminates
+TLS directly.
+</Note>
+
+## Logging in production
+
+Bootstrap the logging system from the environment early in your entry point:
+
+```swift
+@main
+struct Entrypoint {
+    static func main() async throws {
+        var env = try Environment.detect()
+        try LoggingSystem.bootstrap(from: &env)
+
+        let app = try await Application.make(env)
+        // …
+    }
+}
+```
+
+`LoggingSystem.bootstrap(from:)` reads the `--log` command-line flag and the `LOG_LEVEL` environment
+variable. If neither is set, it uses `.notice` in production and `.info` in all other environments.
+
+Override the level at runtime:
+
+```bash
+./Run serve --env production --log debug
+# or
+LOG_LEVEL=warning ./Run serve --env production
+```
+
+## Docker deployment
+
+Docker is the most portable way to ship a Vapor application. Use a multi-stage build to keep the
+final image small.
+
+<CodeGroup>
+
+```dockerfile Dockerfile
+# ---- Build stage ----
+FROM swift:6.0 AS build
+
+WORKDIR /build
+COPY Package.swift Package.resolved ./
+COPY Sources ./Sources
+COPY Resources ./Resources
+
+RUN swift build -c release --disable-sandbox
+
+# ---- Runtime stage ----
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+        libatomic1 \
+        libicu70 \
+        libxml2 \
+        libbsd0 \
+        libcurl4 \
+        libz3-4 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the compiled binary from the build stage
+COPY --from=build /build/.build/release/Run ./Run
+
+# Copy any runtime resources (Leaf templates, public files, etc.)
+COPY --from=build /build/Resources ./Resources
+COPY --from=build /build/Public ./Public
+
+EXPOSE 8080
+
+CMD ["./Run", "serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
+```
+
+```yaml docker-compose.yml
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://user:password@db:5432/myapp
+      LOG_LEVEL: notice
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: myapp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+```
+
+</CodeGroup>
+
+Build and run:
+
+```bash
+docker build -t my-vapor-app .
+docker run -p 8080:8080 --env DATABASE_URL=... my-vapor-app
+```
+
+<Tip>
+Pin the Swift version in your `FROM swift:6.0` line so that builds are reproducible. Using `latest`
+can cause unexpected build failures when a new Swift version is released.
+</Tip>
+
+## Running on Linux
+
+Vapor targets Ubuntu 22.04 and later (and any other Linux distribution supported by the Swift
+toolchain). The runtime dependencies are the Swift standard library and a handful of system libraries
+(`libicu`, `libxml2`, `libcurl`). The Docker example above lists all required packages.
+
+When building natively on a Linux host:
+
+```bash
+# Install the Swift toolchain via swiftly or official tarball
+swift build -c release
+.build/release/Run serve --env production --hostname 0.0.0.0
+```
+
+## Graceful shutdown
+
+Vapor's `ServeCommand` installs handlers for `SIGINT` and `SIGTERM`. When either signal is received,
+the running promise resolves, `execute()` returns, and `asyncShutdown()` is called:
+
+```swift
+let app = try await Application.make(.production)
+try configure(app)
+try await app.execute()          // blocks until SIGTERM / SIGINT
+try await app.asyncShutdown()    // runs lifecycle shutdown handlers
+```
+
+The HTTP server waits up to `shutdownTimeout` (default 10 seconds) for in-flight requests to
+complete before closing. Increase this if your handlers may take longer:
+
+```swift
+app.http.server.configuration.shutdownTimeout = .seconds(30)
+```
+
+## Health checks
+
+Add a lightweight health check endpoint that your load balancer or orchestrator can poll:
+
+```swift
+app.get("health") { req -> HTTPStatus in
+    // Optionally verify database connectivity, etc.
+    return .ok
+}
+```
+
+Kubernetes liveness and readiness probe example:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+## Unix domain sockets
+
+For co-located processes (e.g. Vapor behind nginx on the same host), bind to a Unix domain socket
+instead of a TCP port to reduce overhead:
+
+```bash
+./Run serve --unix-socket /tmp/vapor.sock
+```
+
+Then point nginx at the socket:
+
+```nginx
+upstream vapor {
+    server unix:/tmp/vapor.sock;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://vapor;
+    }
+}
+```

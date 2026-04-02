@@ -1,0 +1,140 @@
+---
+title: "Installation"
+description: "Install Vapor and set up your Swift development environment"
+keywords: ["vapor", "swift", "installation", "setup", "spm", "swift package manager"]
+---
+
+Vapor is a server-side Swift web framework built on SwiftNIO. Before you can use it, you need Swift installed on your machine.
+
+## System requirements
+
+- **Swift** 6.0 or later
+- **macOS** 10.15 (Catalina) or later, **iOS** 13+, **tvOS** 13+, **watchOS** 6+, or **Linux**
+
+<Steps>
+  <Step title="Install Swift">
+    Download and install Swift from [swift.org/install](https://swift.org/install).
+
+    <Tabs>
+      <Tab title="macOS">
+        The easiest way to get Swift on macOS is through **Xcode**, which bundles the Swift toolchain. Install Xcode from the Mac App Store, or download it from [developer.apple.com](https://developer.apple.com/xcode/).
+
+        Alternatively, download a standalone Swift toolchain from [swift.org](https://swift.org/install) if you prefer to use a different editor.
+
+        Verify your installation:
+
+        ```bash
+        swift --version
+        ```
+      </Tab>
+      <Tab title="Linux">
+        Download the Swift toolchain for your Linux distribution from [swift.org/install](https://swift.org/install). Ubuntu, Fedora, and Amazon Linux are officially supported.
+
+        Follow the platform-specific instructions on swift.org to install the required dependencies and set up your `PATH`.
+
+        Verify your installation:
+
+        ```bash
+        swift --version
+        ```
+
+        <Note>
+          Docker is a convenient alternative on Linux. The official Swift Docker images at [hub.docker.com/_/swift](https://hub.docker.com/_/swift) come with Swift pre-installed and work well for development and deployment.
+        </Note>
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Create a Swift package">
+    Vapor is distributed as a Swift Package Manager (SPM) package. Start by creating a new executable package:
+
+    ```bash
+    mkdir MyApp && cd MyApp
+    swift package init --name MyApp --type executable
+    ```
+
+    This generates a `Package.swift` manifest and a `Sources/` directory with a basic executable target.
+  </Step>
+
+  <Step title="Add Vapor as a dependency">
+    Open `Package.swift` and add Vapor to your package's dependencies. Your manifest should look like this:
+
+    ```swift Package.swift
+    // swift-tools-version:6.0
+    import PackageDescription
+
+    let package = Package(
+        name: "MyApp",
+        platforms: [
+            .macOS(.v10_15)
+        ],
+        dependencies: [
+            .package(url: "https://github.com/vapor/vapor.git", from: "4.0.0"),
+        ],
+        targets: [
+            .executableTarget(
+                name: "App",
+                dependencies: [
+                    .product(name: "Vapor", package: "vapor"),
+                ]
+            ),
+        ]
+    )
+    ```
+
+    Vapor ships three library products you can add as dependencies:
+
+    | Product | Purpose |
+    |---|---|
+    | `Vapor` | The core framework — routing, middleware, HTTP server, and more. |
+    | `XCTVapor` | XCTest-based helpers for writing integration tests against your app. |
+    | `VaporTesting` | Swift Testing–based helpers for writing integration tests against your app. |
+
+    Add `XCTVapor` or `VaporTesting` to your test target's dependencies when you are ready to write tests.
+  </Step>
+
+  <Step title="Fetch dependencies">
+    Resolve and fetch the package graph:
+
+    ```bash
+    swift package resolve
+    ```
+
+    SPM downloads Vapor and its transitive dependencies (SwiftNIO, swift-crypto, etc.) into the local `.build` cache.
+  </Step>
+
+  <Step title="Open in your editor">
+    <Tabs>
+      <Tab title="Xcode">
+        Open `Package.swift` directly in Xcode:
+
+        ```bash
+        open Package.swift
+        ```
+
+        Xcode treats `Package.swift` as the project file. After the package graph loads, select the `App` scheme and choose a destination to build and run.
+
+        <Tip>
+          If Xcode does not automatically resolve packages on first open, go to **File → Packages → Resolve Package Versions**.
+        </Tip>
+      </Tab>
+      <Tab title="VS Code">
+        Install the [Swift extension for VS Code](https://marketplace.visualstudio.com/items?itemName=sswg.swift-lang) maintained by the Swift Server Workgroup. Then open your project folder:
+
+        ```bash
+        code .
+        ```
+
+        The extension provides code completion, inline diagnostics, and test support via SourceKit-LSP.
+      </Tab>
+      <Tab title="Terminal">
+        You can build and run entirely from the command line without an IDE:
+
+        ```bash
+        swift build
+        swift run
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+</Steps>

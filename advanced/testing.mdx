@@ -1,0 +1,306 @@
+---
+title: "Testing"
+description: "Test your Vapor application with VaporTesting and XCTVapor"
+keywords: ["vapor", "testing", "VaporTesting", "XCTVapor", "XCTest", "swift-testing", "inMemory"]
+---
+
+Vapor provides two testing modules that share the same underlying request/response infrastructure:
+
+<CardGroup cols={2}>
+  <Card title="VaporTesting" icon="flask-conical">
+    For use with Swift's built-in **swift-testing** framework (`@Test` functions). Import
+    `VaporTesting` and use `app.testing()` and `withApp`.
+  </Card>
+  <Card title="XCTVapor" icon="vial">
+    For use with **XCTest** (`XCTestCase` subclasses). Import `XCTVapor` and use
+    `app.testable()`.
+  </Card>
+</CardGroup>
+
+Both modules dispatch requests through the same `Application.InMemory` or `Application.Live` tester
+so you can choose the framework that fits your project without changing the test logic.
+
+## Setting up a test application
+
+Both modules use `Application(.testing)` to create an isolated application instance. The `.testing`
+environment sanitizes command-line arguments so that Xcode's test runner flags do not leak into
+Vapor's argument parsing.
+
+<Tabs>
+  <Tab title="VaporTesting">
+    Use the `withApp` helper, which creates the application, calls your configure closure, runs the
+    test body, and always calls `app.asyncShutdown()` — even if the test throws.
+
+    ```swift
+    import Testing
+    import VaporTesting
+    import Vapor
+
+    @Test
+    func helloWorld() async throws {
+        try await withApp(configure: configure) { app in
+            try await app.testing().test(.GET, "hello") { res async in
+                #expect(res.status == .ok)
+                #expect(res.body.string == "Hello, world!")
+            }
+        }
+    }
+    ```
+
+    You can omit the `configure` parameter when your routes are registered in the closure directly:
+
+    ```swift
+    @Test
+    func customRoute() async throws {
+        try await withApp { app in
+            app.get("ping") { _ in "pong" }
+
+            try await app.testing().test(.GET, "ping") { res async in
+                #expect(res.status == .ok)
+                #expect(res.body.string == "pong")
+            }
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="XCTVapor">
+    Subclass `XCTVaporTests` or manage the app lifecycle manually in `setUp`/`tearDown`:
+
+    ```swift
+    import XCTest
+    import XCTVapor
+    import Vapor
+
+    final class AppTests: XCTestCase {
+        var app: Application!
+
+        override func setUp() async throws {
+            self.app = try await Application.make(.testing)
+            try configure(app)
+        }
+
+        override func tearDown() async throws {
+            try await app.asyncShutdown()
+        }
+
+        func testHelloWorld() async throws {
+            try await app.testable().test(.GET, "hello") { res in
+                XCTAssertEqual(res.status, .ok)
+                XCTAssertEqual(res.body.string, "Hello, world!")
+            }
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Testing methods: in-memory vs. live
+
+Both `testing()` and `testable()` accept an optional `method` parameter:
+
+| Method | Description |
+|--------|-------------|
+| `.inMemory` (default) | Routes requests directly through Vapor's responder. No networking, fastest. |
+| `.running(hostname:port:)` | Binds a real TCP socket, useful for testing TLS or connection-level behaviour. |
+
+```swift
+// In-memory (default)
+let tester = try app.testing(method: .inMemory)
+
+// Live server on a random port
+let tester = try app.testing(method: .running(hostname: "localhost", port: 0))
+```
+
+<Note>
+For most tests, `.inMemory` is the right choice. It exercises the full Vapor middleware and routing
+stack without the overhead of real networking.
+</Note>
+
+## Making test requests
+
+Call `.test(_:_:)` on the tester. The method is chainable so you can issue multiple requests in
+sequence:
+
+```swift
+try await app.testing()
+    .test(.GET, "users") { res async in
+        #expect(res.status == .ok)
+    }
+    .test(.POST, "users", beforeRequest: { req in
+        try req.content.encode(["name": "Alice"])
+    }, afterResponse: { res async in
+        #expect(res.status == .created)
+    })
+```
+
+### Request customisation with `beforeRequest`
+
+Modify the request before it is dispatched using the `beforeRequest` closure:
+
+```swift
+try await app.testing().test(
+    .POST,
+    "login",
+    beforeRequest: { req in
+        try req.content.encode(["email": "user@example.com", "password": "secret"])
+    },
+    afterResponse: { res async in
+        #expect(res.status == .ok)
+    }
+)
+```
+
+### Sending raw headers and bodies
+
+```swift
+try await app.testing().test(
+    .GET,
+    "protected",
+    headers: ["Authorization": "Bearer my-token"]
+) { res async in
+    #expect(res.status == .ok)
+}
+```
+
+## Asserting responses
+
+### Status and headers
+
+```swift
+afterResponse: { res async in
+    #expect(res.status == .ok)
+    #expect(res.headers.contentType == .json)
+}
+```
+
+### Body string
+
+```swift
+afterResponse: { res async in
+    #expect(res.body.string == "Hello, world!")
+}
+```
+
+### Decoding JSON with `Content`
+
+Use `res.content.decode(_:)` to decode JSON or any other `Content` type:
+
+```swift
+struct UserResponse: Content {
+    var id: UUID
+    var name: String
+}
+
+afterResponse: { res async in
+    #expect(res.status == .ok)
+    let user = try res.content.decode(UserResponse.self)
+    #expect(user.name == "Alice")
+}
+```
+
+### VaporTesting helpers
+
+`VaporTesting` provides additional free functions for common assertions:
+
+```swift
+// Check that the decoded value equals the expected value
+expectContent(UserResponse.self, res) { user in
+    #expect(user.name == "Alice")
+}
+
+// Check that a string contains a substring
+expectContains(res.body.string, "Alice")
+
+// Decode JSON and compare with Equatable
+expectJSONEquals(res.body.string, UserResponse(id: someID, name: "Alice"))
+```
+
+## Testing with sessions
+
+Vapor's in-memory session driver is active in the `.testing` environment by default. Test
+session-based behaviour by inspecting the `Set-Cookie` header and replaying it:
+
+```swift
+@Test
+func sessionRoundTrip() async throws {
+    try await withApp(configure: configure) { app in
+        var cookie: HTTPCookies = [:]
+
+        // Set a session value
+        try await app.testing().test(.GET, "sessions/set/alice") { res async in
+            #expect(res.status == .ok)
+            cookie = res.headers.setCookie ?? [:]
+        }
+
+        // Read it back, sending the cookie
+        try await app.testing().test(
+            .GET,
+            "sessions/get",
+            beforeRequest: { req in
+                req.headers.cookie = cookie
+            },
+            afterResponse: { res async in
+                #expect(res.body.string == "alice")
+            }
+        )
+    }
+}
+```
+
+## Test lifecycle and cleanup
+
+`withApp` always shuts down the application, even when the test body throws:
+
+```swift
+// withApp source — the app is shut down in both the success and error path
+public func withApp<T>(
+    configure: ((Application) async throws -> Void)? = nil,
+    _ test: (Application) async throws -> T
+) async throws -> T {
+    let app = try await Application.make(.testing)
+    let result: T
+    do {
+        try await configure?(app)
+        result = try await test(app)
+    } catch {
+        try? await app.asyncShutdown()
+        throw error
+    }
+    try await app.asyncShutdown()
+    return result
+}
+```
+
+When using XCTest manually, call `app.asyncShutdown()` in `tearDown`:
+
+```swift
+override func tearDown() async throws {
+    try await app.asyncShutdown()
+    app = nil
+}
+```
+
+<Warning>
+Forgetting to shut down the application causes `Application.shutdown()` to be called from `deinit`,
+which logs an error and may leave resources open. Always shut down explicitly.
+</Warning>
+
+## Choosing the right module
+
+<AccordionGroup>
+  <Accordion title="When to use VaporTesting">
+    Use `VaporTesting` when your test target uses Swift's `@Test` and `#expect` macros (swift-testing
+    framework, available from Xcode 16 / Swift 6). `VaporTesting` records failures through
+    `Testing.Issue`, which integrates correctly with the swift-testing runner.
+  </Accordion>
+  <Accordion title="When to use XCTVapor">
+    Use `XCTVapor` when your test target subclasses `XCTestCase`. `XCTVapor` calls `XCTFail` so
+    failures are reported through the Xcode test navigator in the familiar way.
+  </Accordion>
+  <Accordion title="Mixing both in one target">
+    Avoid mixing `app.testing()` and `app.testable()` in the same test target. Each module detects
+    whether it is running inside the correct framework and prints a prominent warning if called from
+    the wrong context. Separate your swift-testing tests and XCTest tests into different test targets
+    if you need both.
+  </Accordion>
+</AccordionGroup>
